@@ -1,7 +1,7 @@
 From 27f28e1050b27ff6039925107b7569988d750d8c Mon Sep 17 00:00:00 2001
 From: xyTom <xytom@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 04:54:51 +0000
-Subject: [PATCH] release: harden 0.2.0 publishing
+Subject: [PATCH 1/2] release: harden 0.2.0 publishing
 
 ---
  .github/workflows/compliance.yml           |  8 +++
@@ -513,6 +513,451 @@ index 0000000..8625f51
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+-- 
+2.39.5
+
+
+From c73070211c9bd840e9ffef96d7874cfcbdb11162 Mon Sep 17 00:00:00 2001
+From: xyTom <xytom@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 05:03:18 +0000
+Subject: [PATCH 2/2] fix: require audited registry publishing
+
+---
+ .github/workflows/compliance.yml       |  2 +-
+ .github/workflows/publish-npm.yml      | 23 +++++---
+ .github/workflows/publish-pypi.yml     |  9 +++
+ docs/ci-and-tests.md                   | 21 ++++++-
+ scripts/check_final_audit.py           | 81 ++++++++++++++++++++++++++
+ scripts/check_release_versions.py      | 28 +++++----
+ tests/compliance/test_docs_required.py | 26 +++++++++
+ tests/test_release_checks.py           | 80 +++++++++++++++++++++++++
+ 8 files changed, 250 insertions(+), 20 deletions(-)
+ create mode 100644 scripts/check_final_audit.py
+ create mode 100644 tests/test_release_checks.py
+
+diff --git a/.github/workflows/compliance.yml b/.github/workflows/compliance.yml
+index 3756eb6..bff5ce0 100644
+--- a/.github/workflows/compliance.yml
++++ b/.github/workflows/compliance.yml
+@@ -21,7 +21,7 @@ jobs:
+           python-version: "3.11"
+ 
+       - name: Set up Node
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@v6
+         with:
+           node-version: "22"
+ 
+diff --git a/.github/workflows/publish-npm.yml b/.github/workflows/publish-npm.yml
+index f9edb69..79bbe7a 100644
+--- a/.github/workflows/publish-npm.yml
++++ b/.github/workflows/publish-npm.yml
+@@ -1,8 +1,6 @@
+ name: publish-npm
+ 
+ on:
+-  release:
+-    types: [published]
+   workflow_dispatch:
+     inputs:
+       release_tag:
+@@ -11,6 +9,7 @@ on:
+         default: "v0.2.0"
+ 
+ permissions:
++  actions: read
+   contents: read
+ 
+ jobs:
+@@ -18,7 +17,7 @@ jobs:
+     name: Test and pack npm launcher
+     runs-on: ubuntu-latest
+     env:
+-      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
++      RELEASE_TAG: ${{ inputs.release_tag }}
+     steps:
+       - name: Check out repository
+         uses: actions/checkout@v6.0.2
+@@ -31,14 +30,23 @@ jobs:
+           python-version: "3.11"
+ 
+       - name: Set up Node
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@v6
+         with:
+           node-version: "24"
+           registry-url: "https://registry.npmjs.org"
++          package-manager-cache: false
+ 
+       - name: Validate release metadata
+         run: python scripts/check_release_versions.py --tag "$RELEASE_TAG"
+ 
++      - name: Require final audit for release commit
++        env:
++          GITHUB_TOKEN: ${{ github.token }}
++        run: |
++          python scripts/check_final_audit.py \
++            --repo "$GITHUB_REPOSITORY" \
++            --sha "$(git rev-parse HEAD)"
++
+       - name: Test launcher
+         run: make check-npm-launcher
+ 
+@@ -72,13 +80,14 @@ jobs:
+           path: dist
+ 
+       - name: Set up Node
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@v6
+         with:
+           node-version: "24"
+           registry-url: "https://registry.npmjs.org"
++          package-manager-cache: false
+ 
+-      - name: Install current npm CLI
+-        run: npm install --global npm@latest
++      - name: Install OIDC-capable npm CLI
++        run: npm install --global npm@11.18.0
+ 
+       - name: Publish launcher with provenance
+         run: npm publish dist/*.tgz --access public --provenance
+diff --git a/.github/workflows/publish-pypi.yml b/.github/workflows/publish-pypi.yml
+index d7df9af..f407984 100644
+--- a/.github/workflows/publish-pypi.yml
++++ b/.github/workflows/publish-pypi.yml
+@@ -11,6 +11,7 @@ on:
+         default: "v0.2.0"
+ 
+ permissions:
++  actions: read
+   contents: read
+ 
+ jobs:
+@@ -38,6 +39,14 @@ jobs:
+       - name: Validate release metadata
+         run: python scripts/check_release_versions.py --tag "$RELEASE_TAG"
+ 
++      - name: Require final audit for release commit
++        env:
++          GITHUB_TOKEN: ${{ github.token }}
++        run: |
++          python scripts/check_final_audit.py \
++            --repo "$GITHUB_REPOSITORY" \
++            --sha "$(git rev-parse HEAD)"
++
+       - name: Build source and wheel distributions
+         run: python -m build
+ 
+diff --git a/docs/ci-and-tests.md b/docs/ci-and-tests.md
+index cbd76e4..a6d608c 100644
+--- a/docs/ci-and-tests.md
++++ b/docs/ci-and-tests.md
+@@ -17,7 +17,26 @@ Report files are overwritten by whichever suite or benchmark was run most recent
+ 
+ ## PyPI Release
+ 
+-Publish through the release helper so the same build, check, upload, and install-verification flow is used every time:
++The release commit must have successful `compliance`, `real-workloads`,
++`swebench-lite`, and `final-audit` workflow runs before either registry publish
++workflow will proceed. Create `v<project-version>` at that exact commit, run the
++three evidence workflows, then run `final-audit` with their run IDs.
++
++Publishing a GitHub Release triggers `.github/workflows/publish-pypi.yml`. The
++workflow checks out the release tag, validates package and changelog versions,
++requires a successful `final-audit` for the same commit, builds the wheel and
++sdist, inspects desktop resources and entry points, installs the wheel in a
++clean environment, and only then publishes through PyPI trusted publishing.
++
++The npm launcher has its own version and is published independently. Run the
++manual `.github/workflows/publish-npm.yml` workflow with the Python release tag
++that contains the launcher source. It runs the launcher tests, packs npm
++`coding-tools-mcp`, requires the same final audit, and publishes through npm
++trusted publishing. Bump `npm/coding-tools-mcp/package.json` before every npm
++release; npm package versions cannot be overwritten.
++
++For local or recovery publishing, use the release helper so the same build,
++check, upload, and install-verification flow is used every time:
+ 
+ ```bash
+ make publish-testpypi
+diff --git a/scripts/check_final_audit.py b/scripts/check_final_audit.py
+new file mode 100644
+index 0000000..a6fbe3a
+--- /dev/null
++++ b/scripts/check_final_audit.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""Require a successful final-audit workflow run for a release commit."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from urllib.error import HTTPError
++from urllib.parse import quote
++from urllib.request import Request, urlopen
++
++
++def select_successful_run(workflow_runs: list[dict[str, object]], sha: str) -> dict[str, object] | None:
++    matches = [
++        run
++        for run in workflow_runs
++        if run.get("head_sha") == sha
++        and run.get("status") == "completed"
++        and run.get("conclusion") == "success"
++    ]
++    if not matches:
++        return None
++    return max(matches, key=lambda run: int(run.get("id", 0)))
++
++
++def fetch_runs(api_url: str, repo: str, workflow: str, token: str) -> list[dict[str, object]]:
++    owner, name = repo.split("/", 1)
++    base = (
++        f"{api_url.rstrip('/')}/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
++        f"/actions/workflows/{quote(workflow, safe='')}/runs"
++    )
++    runs: list[dict[str, object]] = []
++    for page in range(1, 11):
++        request = Request(
++            f"{base}?status=success&per_page=100&page={page}",
++            headers={
++                "Accept": "application/vnd.github+json",
++                "Authorization": f"Bearer {token}",
++                "X-GitHub-Api-Version": "2022-11-28",
++                "User-Agent": "coding-tools-mcp-release-audit",
++            },
++        )
++        try:
++            with urlopen(request, timeout=30) as response:
++                payload = json.load(response)
++        except HTTPError as error:
++            detail = error.read().decode("utf-8", errors="replace")
++            raise SystemExit(f"GitHub Actions API failed with {error.code}: {detail}") from error
++        page_runs = payload.get("workflow_runs", [])
++        if not isinstance(page_runs, list):
++            raise SystemExit("GitHub Actions API returned an invalid workflow_runs payload")
++        runs.extend(page_runs)
++        if len(page_runs) < 100:
++            break
++    return runs
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--repo", required=True, help="GitHub repository as owner/name")
++    parser.add_argument("--sha", required=True, help="Release commit SHA")
++    parser.add_argument("--workflow", default="final-audit.yml")
++    args = parser.parse_args()
++
++    token = os.environ.get("GITHUB_TOKEN", "")
++    if not token:
++        raise SystemExit("GITHUB_TOKEN is required to verify final-audit evidence")
++    api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
++    run = select_successful_run(fetch_runs(api_url, args.repo, args.workflow, token), args.sha)
++    if run is None:
++        raise SystemExit(
++            f"no successful {args.workflow} run was found for release commit {args.sha}"
++        )
++
++    print(f"Final audit OK: {run.get('html_url', '')} ({args.sha})")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/check_release_versions.py b/scripts/check_release_versions.py
+index 8625f51..c653cda 100644
+--- a/scripts/check_release_versions.py
++++ b/scripts/check_release_versions.py
+@@ -13,39 +13,45 @@ import tomllib
+ ROOT = Path(__file__).resolve().parents[1]
+ 
+ 
+-def main() -> int:
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--tag", required=True, help="Release tag, for example v0.2.0")
+-    args = parser.parse_args()
+-
+-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
++def validate_release(root: Path, tag: str) -> tuple[str, str]:
++    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+     project_version = pyproject["project"]["version"]
+ 
+-    package_init = (ROOT / "coding_tools_mcp" / "__init__.py").read_text(encoding="utf-8")
++    package_init = (root / "coding_tools_mcp" / "__init__.py").read_text(encoding="utf-8")
+     match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', package_init, re.MULTILINE)
+     if not match:
+         raise SystemExit("coding_tools_mcp.__version__ was not found")
+     module_version = match.group(1)
+ 
+     expected_tag = f"v{project_version}"
+-    if args.tag != expected_tag:
+-        raise SystemExit(f"release tag {args.tag!r} does not match {expected_tag!r}")
++    if tag != expected_tag:
++        raise SystemExit(f"release tag {tag!r} does not match {expected_tag!r}")
+     if module_version != project_version:
+         raise SystemExit(
+             f"pyproject version {project_version!r} does not match module version {module_version!r}"
+         )
+ 
+-    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
++    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+     if not re.search(rf"^## {re.escape(project_version)} - \d{{4}}-\d{{2}}-\d{{2}}$", changelog, re.MULTILINE):
+         raise SystemExit(f"CHANGELOG.md has no dated {project_version} release heading")
+     if re.search(r"^## Unreleased\s*$", changelog, re.MULTILINE):
+         raise SystemExit("CHANGELOG.md still contains an Unreleased section")
+ 
+-    npm_package = json.loads((ROOT / "npm" / "coding-tools-mcp" / "package.json").read_text(encoding="utf-8"))
++    npm_package = json.loads((root / "npm" / "coding-tools-mcp" / "package.json").read_text(encoding="utf-8"))
+     npm_version = npm_package["version"]
+     if re.search(r"(?:^|[-.])(alpha|beta|rc|dev|next)(?:[-.]|$)", npm_version, re.IGNORECASE):
+         raise SystemExit(f"npm launcher version {npm_version!r} is not stable")
+ 
++    return project_version, npm_version
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--tag", required=True, help="Release tag, for example v0.2.0")
++    args = parser.parse_args()
++
++    project_version, npm_version = validate_release(ROOT, args.tag)
++
+     print(
+         f"Release metadata OK: Python {project_version} ({args.tag}), "
+         f"npm launcher {npm_version}"
+diff --git a/tests/compliance/test_docs_required.py b/tests/compliance/test_docs_required.py
+index 8543779..a648b57 100644
+--- a/tests/compliance/test_docs_required.py
++++ b/tests/compliance/test_docs_required.py
+@@ -86,6 +86,7 @@ class RequiredDocsTests(unittest.TestCase):
+             "make test",
+             "make test-protocol",
+             "make test-integration",
++            "make check-npm-launcher",
+             "make dogfood-smoke",
+             "make benchmark-latency",
+             "make benchmark-smoke",
+@@ -110,6 +111,31 @@ class RequiredDocsTests(unittest.TestCase):
+             with self.subTest(workflow="docker-smoke", needle=needle):
+                 self.assertIn(needle, docker_smoke)
+ 
++        publish_pypi = (ROOT / ".github/workflows/publish-pypi.yml").read_text(encoding="utf-8")
++        for needle in (
++            "scripts/check_release_versions.py",
++            "scripts/check_final_audit.py",
++            "Verify wheel contents and installation",
++            "pypa/gh-action-pypi-publish",
++        ):
++            with self.subTest(workflow="publish-pypi", needle=needle):
++                self.assertIn(needle, publish_pypi)
++
++        publish_npm = (ROOT / ".github/workflows/publish-npm.yml").read_text(encoding="utf-8")
++        for needle in (
++            "workflow_dispatch",
++            "scripts/check_final_audit.py",
++            "npm@11.18.0",
++            "npm publish",
++        ):
++            with self.subTest(workflow="publish-npm", needle=needle):
++                self.assertIn(needle, publish_npm)
++
++        final_audit = (ROOT / ".github/workflows/final-audit.yml").read_text(encoding="utf-8")
++        for needle in ("git rev-list", "scripts/check_release_versions.py", "Validate referenced runs"):
++            with self.subTest(workflow="final-audit", needle=needle):
++                self.assertIn(needle, final_audit)
++
+         smoke_script = (ROOT / "scripts/mcp_smoke.py").read_text(encoding="utf-8")
+         for needle in ("server_info", "exec_command"):
+             with self.subTest(target="mcp_smoke", needle=needle):
+diff --git a/tests/test_release_checks.py b/tests/test_release_checks.py
+new file mode 100644
+index 0000000..6e2839e
+--- /dev/null
++++ b/tests/test_release_checks.py
+@@ -0,0 +1,80 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++from scripts.check_final_audit import select_successful_run
++from scripts.check_release_versions import validate_release
++
++
++class ReleaseMetadataTests(unittest.TestCase):
++    def _write_release_tree(
++        self,
++        root: Path,
++        *,
++        project_version: str = "0.2.0",
++        module_version: str = "0.2.0",
++        npm_version: str = "0.1.0",
++        changelog: str = "# Changelog\n\n## 0.2.0 - 2026-07-24\n",
++    ) -> None:
++        (root / "coding_tools_mcp").mkdir(parents=True)
++        (root / "npm" / "coding-tools-mcp").mkdir(parents=True)
++        (root / "pyproject.toml").write_text(
++            f'[project]\nversion = "{project_version}"\n', encoding="utf-8"
++        )
++        (root / "coding_tools_mcp" / "__init__.py").write_text(
++            f'__version__ = "{module_version}"\n', encoding="utf-8"
++        )
++        (root / "npm" / "coding-tools-mcp" / "package.json").write_text(
++            json.dumps({"version": npm_version}), encoding="utf-8"
++        )
++        (root / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
++
++    def test_release_metadata_accepts_matching_stable_versions(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self._write_release_tree(root)
++            self.assertEqual(validate_release(root, "v0.2.0"), ("0.2.0", "0.1.0"))
++
++    def test_release_metadata_rejects_unreleased_section(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self._write_release_tree(
++                root,
++                changelog="# Changelog\n\n## Unreleased\n\n## 0.2.0 - 2026-07-24\n",
++            )
++            with self.assertRaisesRegex(SystemExit, "Unreleased"):
++                validate_release(root, "v0.2.0")
++
++    def test_release_metadata_rejects_prerelease_npm_version(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self._write_release_tree(root, npm_version="0.1.0-beta.1")
++            with self.assertRaisesRegex(SystemExit, "not stable"):
++                validate_release(root, "v0.2.0")
++
++
++class FinalAuditTests(unittest.TestCase):
++    def test_selects_latest_successful_run_for_release_sha(self) -> None:
++        runs = [
++            {"id": 1, "head_sha": "abc", "status": "completed", "conclusion": "success"},
++            {"id": 3, "head_sha": "abc", "status": "completed", "conclusion": "success"},
++            {"id": 4, "head_sha": "def", "status": "completed", "conclusion": "success"},
++        ]
++        selected = select_successful_run(runs, "abc")
++        self.assertIsNotNone(selected)
++        assert selected is not None
++        self.assertEqual(selected["id"], 3)
++
++    def test_rejects_failed_or_incomplete_runs(self) -> None:
++        runs = [
++            {"id": 1, "head_sha": "abc", "status": "completed", "conclusion": "failure"},
++            {"id": 2, "head_sha": "abc", "status": "in_progress", "conclusion": None},
++        ]
++        self.assertIsNone(select_successful_run(runs, "abc"))
++
++
++if __name__ == "__main__":
++    unittest.main()
 -- 
 2.39.5
 
