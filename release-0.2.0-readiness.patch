@@ -1,0 +1,518 @@
+From 27f28e1050b27ff6039925107b7569988d750d8c Mon Sep 17 00:00:00 2001
+From: xyTom <xytom@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 04:54:51 +0000
+Subject: [PATCH] release: harden 0.2.0 publishing
+
+---
+ .github/workflows/compliance.yml           |  8 +++
+ .github/workflows/final-audit.yml          | 16 ++++-
+ .github/workflows/publish-npm.yml          | 84 ++++++++++++++++++++++
+ .github/workflows/publish-pypi.yml         | 51 +++++++++++++
+ CHANGELOG.md                               | 45 ++++++------
+ Makefile                                   | 11 ++-
+ npm/coding-tools-mcp/package.json          |  3 +
+ npm/coding-tools-mcp/test/launcher.test.js | 80 +++++++++++++++++++++
+ scripts/check_release_versions.py          | 57 +++++++++++++++
+ 9 files changed, 327 insertions(+), 28 deletions(-)
+ create mode 100644 .github/workflows/publish-npm.yml
+ create mode 100644 npm/coding-tools-mcp/test/launcher.test.js
+ create mode 100644 scripts/check_release_versions.py
+
+diff --git a/.github/workflows/compliance.yml b/.github/workflows/compliance.yml
+index 9e52f40..3756eb6 100644
+--- a/.github/workflows/compliance.yml
++++ b/.github/workflows/compliance.yml
+@@ -20,6 +20,11 @@ jobs:
+         with:
+           python-version: "3.11"
+ 
++      - name: Set up Node
++        uses: actions/setup-node@v4
++        with:
++          node-version: "22"
++
+       - name: Install runtime and CI tools
+         run: |
+           python -m pip install --upgrade pip
+@@ -49,6 +54,9 @@ jobs:
+       - name: Run dispatch inputs gate
+         run: make check-dispatch-inputs
+ 
++      - name: Run npm launcher gate
++        run: make check-npm-launcher
++
+       - name: Run dogfood smoke
+         run: make dogfood-smoke DOGFOOD_PORT=18772
+ 
+diff --git a/.github/workflows/final-audit.yml b/.github/workflows/final-audit.yml
+index 4905271..e378349 100644
+--- a/.github/workflows/final-audit.yml
++++ b/.github/workflows/final-audit.yml
+@@ -15,7 +15,7 @@ on:
+       release_tag:
+         description: "Release tag that points at this commit"
+         required: true
+-        default: "v0.1.3-recovered-final"
++        default: "v0.2.0"
+ 
+ jobs:
+   final-audit:
+@@ -27,6 +27,20 @@ jobs:
+     steps:
+       - name: Check out repository
+         uses: actions/checkout@v6.0.2
++        with:
++          fetch-depth: 0
++
++      - name: Validate release tag and metadata
++        env:
++          EXPECTED_SHA: ${{ github.sha }}
++          RELEASE_TAG: ${{ inputs.release_tag }}
++        run: |
++          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
++          if [ "$tag_sha" != "$EXPECTED_SHA" ]; then
++            echo "release tag $RELEASE_TAG points to $tag_sha, expected $EXPECTED_SHA" >&2
++            exit 1
++          fi
++          python scripts/check_release_versions.py --tag "$RELEASE_TAG"
+ 
+       - name: Validate referenced runs
+         env:
+diff --git a/.github/workflows/publish-npm.yml b/.github/workflows/publish-npm.yml
+new file mode 100644
+index 0000000..f9edb69
+--- /dev/null
++++ b/.github/workflows/publish-npm.yml
+@@ -0,0 +1,84 @@
++name: publish-npm
++
++on:
++  release:
++    types: [published]
++  workflow_dispatch:
++    inputs:
++      release_tag:
++        description: "Existing Python release tag that includes the launcher"
++        required: true
++        default: "v0.2.0"
++
++permissions:
++  contents: read
++
++jobs:
++  test-and-pack:
++    name: Test and pack npm launcher
++    runs-on: ubuntu-latest
++    env:
++      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
++    steps:
++      - name: Check out repository
++        uses: actions/checkout@v6.0.2
++        with:
++          ref: ${{ env.RELEASE_TAG }}
++
++      - name: Set up Python
++        uses: actions/setup-python@v6.2.0
++        with:
++          python-version: "3.11"
++
++      - name: Set up Node
++        uses: actions/setup-node@v4
++        with:
++          node-version: "24"
++          registry-url: "https://registry.npmjs.org"
++
++      - name: Validate release metadata
++        run: python scripts/check_release_versions.py --tag "$RELEASE_TAG"
++
++      - name: Test launcher
++        run: make check-npm-launcher
++
++      - name: Pack launcher
++        working-directory: npm/coding-tools-mcp
++        run: npm pack
++
++      - name: Upload npm package artifact
++        uses: actions/upload-artifact@v7.0.1
++        with:
++          name: npm-package-distribution
++          path: npm/coding-tools-mcp/*.tgz
++          if-no-files-found: error
++          retention-days: 7
++
++  publish-to-npm:
++    name: Publish npm launcher
++    needs: test-and-pack
++    runs-on: ubuntu-latest
++    environment:
++      name: npm
++      url: https://www.npmjs.com/package/coding-tools-mcp
++    permissions:
++      contents: read
++      id-token: write
++    steps:
++      - name: Download npm package artifact
++        uses: actions/download-artifact@v7.0.0
++        with:
++          name: npm-package-distribution
++          path: dist
++
++      - name: Set up Node
++        uses: actions/setup-node@v4
++        with:
++          node-version: "24"
++          registry-url: "https://registry.npmjs.org"
++
++      - name: Install current npm CLI
++        run: npm install --global npm@latest
++
++      - name: Publish launcher with provenance
++        run: npm publish dist/*.tgz --access public --provenance
+diff --git a/.github/workflows/publish-pypi.yml b/.github/workflows/publish-pypi.yml
+index 8785ecb..d7df9af 100644
+--- a/.github/workflows/publish-pypi.yml
++++ b/.github/workflows/publish-pypi.yml
+@@ -4,6 +4,11 @@ on:
+   release:
+     types: [published]
+   workflow_dispatch:
++    inputs:
++      release_tag:
++        description: "Existing release tag to publish"
++        required: true
++        default: "v0.2.0"
+ 
+ permissions:
+   contents: read
+@@ -12,9 +17,13 @@ jobs:
+   build:
+     name: Build distribution
+     runs-on: ubuntu-latest
++    env:
++      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+     steps:
+       - name: Check out repository
+         uses: actions/checkout@v6.0.2
++        with:
++          ref: ${{ env.RELEASE_TAG }}
+ 
+       - name: Set up Python
+         uses: actions/setup-python@v6.2.0
+@@ -26,12 +35,54 @@ jobs:
+           python -m pip install --upgrade pip
+           python -m pip install build twine
+ 
++      - name: Validate release metadata
++        run: python scripts/check_release_versions.py --tag "$RELEASE_TAG"
++
+       - name: Build source and wheel distributions
+         run: python -m build
+ 
+       - name: Check distribution metadata
+         run: python -m twine check dist/*
+ 
++      - name: Verify wheel contents and installation
++        run: |
++          python - <<'PY'
++          import glob
++          import zipfile
++
++          wheel = glob.glob("dist/*.whl")
++          if len(wheel) != 1:
++              raise SystemExit(f"expected one wheel, found {wheel}")
++          required = {
++              "coding_tools_mcp/__init__.py",
++              "mcp_desktop_client/app.py",
++              "mcp_desktop_client/locales/app_zh_CN.qm",
++              "mcp_desktop_client/locales/app_zh_CN.ts",
++          }
++          with zipfile.ZipFile(wheel[0]) as archive:
++              names = set(archive.namelist())
++              missing = sorted(required - names)
++              if missing:
++                  raise SystemExit(f"wheel is missing: {missing}")
++              entry_points = archive.read(
++                  next(name for name in names if name.endswith("entry_points.txt"))
++              ).decode()
++              for command in ("coding-tools-mcp", "coding-tools-mcp-desktop"):
++                  if command not in entry_points:
++                      raise SystemExit(f"wheel entry point is missing: {command}")
++          PY
++          python -m venv .package-verify
++          .package-verify/bin/python -m pip install dist/*.whl
++          .package-verify/bin/coding-tools-mcp --help >/dev/null
++          .package-verify/bin/python - <<'PY'
++          import coding_tools_mcp
++          import tomllib
++
++          with open("pyproject.toml", "rb") as handle:
++              expected = tomllib.load(handle)["project"]["version"]
++          assert coding_tools_mcp.__version__ == expected
++          PY
++
+       - name: Upload distribution artifacts
+         uses: actions/upload-artifact@v7.0.1
+         with:
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b32c635..3e0d436 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,30 +1,5 @@
+ # Changelog
+ 
+-## Unreleased
+-
+-### Added
+-
+-- `--dangerously-fake-readonly-annotations` and
+-  `CODING_TOOLS_MCP_DANGEROUSLY_FAKE_READONLY_ANNOTATIONS`, which report every tool
+-  in `tools/list` as read-only and non-destructive. This restores the one capability
+-  lost with the `compat-readonly-all` profile in 0.2.0: a client that gates on
+-  annotations is unreachable from server-side permission modes, so `dangerous` mode
+-  cannot quiet it. Unlike the old profile the catalog is untouched and the claim is
+-  fenced in — it requires `dangerous` permission mode, requires authentication over
+-  HTTP because a tunnel forwards to a loopback bind, and is confined to `tools/list`.
+-  `server_info.annotation_override`, the server card's `tools.annotationOverride`,
+-  and `check_exec_environment` all report it, and both `server_info` and the server
+-  card keep publishing the real per-tool annotations.
+-- A `deploy-sandbox-control` workflow that deploys the Cloudflare control-plane
+-  Worker on every push touching `cloudflare/sandbox-control/**` or
+-  `start-sandbox.yml`. Nothing deployed the Worker before, so its half of the
+-  `workflow_dispatch` contract could sit unshipped indefinitely while the workflow
+-  half moved on, which GitHub rejects with `422 Unexpected inputs provided` before
+-  creating a run.
+-- `make check-dispatch-inputs`, which compares the Worker's dispatch body against
+-  `start-sandbox.yml`'s declared `workflow_dispatch` inputs and cross-checks
+-  `workflow_call`. It gates the deploy and runs in `make ci`.
+-
+ ## 0.2.0 - 2026-07-24
+ 
+ ### Changed
+@@ -99,6 +74,26 @@
+   `auth_token`, and `hide_auth_token`, so a sandbox can publish one reusable
+   Cloudflare named hostname with a secret-managed bearer token kept out of
+   workflow logs and run summaries.
++- `--dangerously-fake-readonly-annotations` and
++  `CODING_TOOLS_MCP_DANGEROUSLY_FAKE_READONLY_ANNOTATIONS`, which report every tool
++  in `tools/list` as read-only and non-destructive. This restores the one capability
++  lost when the `compat-readonly-all` profile was removed: a client that gates on
++  annotations is unreachable from server-side permission modes, so `dangerous` mode
++  cannot quiet it. Unlike the old profile the catalog is untouched and the claim is
++  fenced in — it requires `dangerous` permission mode, requires authentication over
++  HTTP because a tunnel forwards to a loopback bind, and is confined to `tools/list`.
++  `server_info.annotation_override`, the server card's `tools.annotationOverride`,
++  and `check_exec_environment` all report it, and both `server_info` and the server
++  card keep publishing the real per-tool annotations.
++- A `deploy-sandbox-control` workflow that deploys the Cloudflare control-plane
++  Worker on every push touching `cloudflare/sandbox-control/**` or
++  `start-sandbox.yml`. Nothing deployed the Worker before, so its half of the
++  `workflow_dispatch` contract could sit unshipped indefinitely while the workflow
++  half moved on, which GitHub rejects with `422 Unexpected inputs provided` before
++  creating a run.
++- `make check-dispatch-inputs`, which compares the Worker's dispatch body against
++  `start-sandbox.yml`'s declared `workflow_dispatch` inputs and cross-checks
++  `workflow_call`. It gates the deploy and runs in `make ci`.
+ 
+ ### Removed
+ 
+diff --git a/Makefile b/Makefile
+index 3aa97bd..218636b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -17,7 +17,7 @@ DESKTOP_PACKAGE := apps/desktop-client/mcp_desktop_client
+ DESKTOP_TS := $(DESKTOP_PACKAGE)/locales/app_zh_CN.ts
+ DESKTOP_QM := $(DESKTOP_PACKAGE)/locales/app_zh_CN.qm
+ 
+-.PHONY: start lint typecheck test ci check-dispatch-inputs compliance test-protocol test-integration test-mcp-contract test-tool-golden test-security test-e2e test-runtime-semantics test-docs-required test-schema-drift dogfood-mcp dogfood-runner dogfood-smoke benchmark-latency benchmark-smoke benchmark-real-workloads swebench-reference-predictions swebench-preflight swebench-evaluate desktop-i18n-update desktop-i18n-release desktop-i18n-check install-user publish-testpypi publish-pypi publish-all report
++.PHONY: start lint typecheck test ci check-dispatch-inputs check-npm-launcher check-release compliance test-protocol test-integration test-mcp-contract test-tool-golden test-security test-e2e test-runtime-semantics test-docs-required test-schema-drift dogfood-mcp dogfood-runner dogfood-smoke benchmark-latency benchmark-smoke benchmark-real-workloads swebench-reference-predictions swebench-preflight swebench-evaluate desktop-i18n-update desktop-i18n-release desktop-i18n-check install-user publish-testpypi publish-pypi publish-all report
+ 
+ start:
+ 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m coding_tools_mcp --workspace "$(MCP_WORKSPACE)" --host "$(MCP_HOST)" --port "$(MCP_PORT)" $(MCP_ARGS)
+@@ -29,13 +29,20 @@ lint:
+ check-dispatch-inputs:
+ 	$(PYTHON) scripts/check_dispatch_inputs.py
+ 
++check-npm-launcher:
++	cd npm/coding-tools-mcp && npm test
++	cd npm/coding-tools-mcp && npm pack --dry-run --json >/dev/null
++
++check-release:
++	$(PYTHON) scripts/check_release_versions.py --tag v0.2.0
++
+ typecheck:
+ 	$(PYTHON) -m mypy $(MYPY_FLAGS) $(MYPY_TARGETS)
+ 
+ test:
+ 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+ 
+-ci: lint typecheck test check-dispatch-inputs test-protocol test-integration test-docs-required test-schema-drift dogfood-smoke benchmark-latency benchmark-smoke
++ci: lint typecheck test check-dispatch-inputs check-npm-launcher test-protocol test-integration test-docs-required test-schema-drift dogfood-smoke benchmark-latency benchmark-smoke
+ 
+ compliance:
+ 	$(COMPLIANCE_RUNNER) --suite all $(REPORT_FLAG)
+diff --git a/npm/coding-tools-mcp/package.json b/npm/coding-tools-mcp/package.json
+index d324308..d50b7a1 100644
+--- a/npm/coding-tools-mcp/package.json
++++ b/npm/coding-tools-mcp/package.json
+@@ -4,6 +4,9 @@
+   "description": "npm launcher for the coding-tools-mcp Python MCP server (PyPI). Starts the server via uvx or pipx.",
+   "type": "module",
+   "license": "Apache-2.0",
++  "scripts": {
++    "test": "node --test test/*.test.js"
++  },
+   "engines": {
+     "node": ">=18"
+   },
+diff --git a/npm/coding-tools-mcp/test/launcher.test.js b/npm/coding-tools-mcp/test/launcher.test.js
+new file mode 100644
+index 0000000..5af9bd9
+--- /dev/null
++++ b/npm/coding-tools-mcp/test/launcher.test.js
+@@ -0,0 +1,80 @@
++import assert from "node:assert/strict";
++import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { spawnSync } from "node:child_process";
++import test from "node:test";
++import { fileURLToPath } from "node:url";
++
++const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const launcher = path.join(packageRoot, "bin", "coding-tools-mcp.js");
++
++async function writeExecutable(directory, name, body) {
++  const target = path.join(directory, name);
++  await writeFile(target, `#!/bin/sh\n${body}\n`, "utf8");
++  await chmod(target, 0o755);
++  return target;
++}
++
++function runLauncher(binDirectory, args = [], extraEnv = {}) {
++  return spawnSync(process.execPath, [launcher, ...args], {
++    encoding: "utf8",
++    env: {
++      ...process.env,
++      ...extraEnv,
++      PATH: binDirectory,
++    },
++  });
++}
++
++test("uvx receives the pinned Python package and forwarded arguments", async () => {
++  const directory = await mkdtemp(path.join(os.tmpdir(), "coding-tools-mcp-uvx-"));
++  const output = path.join(directory, "args.txt");
++  await writeExecutable(directory, "uvx", 'printf "%s\\n" "$@" > "$RESULT_FILE"');
++
++  const result = runLauncher(directory, ["--stdio", "--workspace", "/repo"], {
++    CODING_TOOLS_MCP_VERSION: "0.2.0",
++    RESULT_FILE: output,
++  });
++
++  assert.equal(result.status, 0, result.stderr);
++  assert.deepEqual((await readFile(output, "utf8")).trim().split("\n"), [
++    "coding-tools-mcp==0.2.0",
++    "--stdio",
++    "--workspace",
++    "/repo",
++  ]);
++});
++
++test("pipx is used when uvx is unavailable", async () => {
++  const directory = await mkdtemp(path.join(os.tmpdir(), "coding-tools-mcp-pipx-"));
++  const output = path.join(directory, "args.txt");
++  await writeExecutable(directory, "pipx", 'printf "%s\\n" "$@" > "$RESULT_FILE"');
++
++  const result = runLauncher(directory, ["--help"], { RESULT_FILE: output });
++
++  assert.equal(result.status, 0, result.stderr);
++  assert.deepEqual((await readFile(output, "utf8")).trim().split("\n"), [
++    "run",
++    "coding-tools-mcp",
++    "--help",
++  ]);
++});
++
++test("the launcher explains how to install a supported runner", async () => {
++  const directory = await mkdtemp(path.join(os.tmpdir(), "coding-tools-mcp-empty-"));
++  const result = runLauncher(directory);
++
++  assert.equal(result.status, 1);
++  assert.match(result.stderr, /neither uvx nor pipx was found/);
++  assert.match(result.stderr, /pip install coding-tools-mcp/);
++});
++
++test("the child exit code is preserved", async () => {
++  const directory = await mkdtemp(path.join(os.tmpdir(), "coding-tools-mcp-exit-"));
++  await writeExecutable(directory, "uvx", "exit 7");
++
++  const result = runLauncher(directory);
++
++  assert.equal(result.status, 7);
++});
+diff --git a/scripts/check_release_versions.py b/scripts/check_release_versions.py
+new file mode 100644
+index 0000000..8625f51
+--- /dev/null
++++ b/scripts/check_release_versions.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Validate release tag, package versions, and release-note coverage."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++import re
++import tomllib
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--tag", required=True, help="Release tag, for example v0.2.0")
++    args = parser.parse_args()
++
++    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
++    project_version = pyproject["project"]["version"]
++
++    package_init = (ROOT / "coding_tools_mcp" / "__init__.py").read_text(encoding="utf-8")
++    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', package_init, re.MULTILINE)
++    if not match:
++        raise SystemExit("coding_tools_mcp.__version__ was not found")
++    module_version = match.group(1)
++
++    expected_tag = f"v{project_version}"
++    if args.tag != expected_tag:
++        raise SystemExit(f"release tag {args.tag!r} does not match {expected_tag!r}")
++    if module_version != project_version:
++        raise SystemExit(
++            f"pyproject version {project_version!r} does not match module version {module_version!r}"
++        )
++
++    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
++    if not re.search(rf"^## {re.escape(project_version)} - \d{{4}}-\d{{2}}-\d{{2}}$", changelog, re.MULTILINE):
++        raise SystemExit(f"CHANGELOG.md has no dated {project_version} release heading")
++    if re.search(r"^## Unreleased\s*$", changelog, re.MULTILINE):
++        raise SystemExit("CHANGELOG.md still contains an Unreleased section")
++
++    npm_package = json.loads((ROOT / "npm" / "coding-tools-mcp" / "package.json").read_text(encoding="utf-8"))
++    npm_version = npm_package["version"]
++    if re.search(r"(?:^|[-.])(alpha|beta|rc|dev|next)(?:[-.]|$)", npm_version, re.IGNORECASE):
++        raise SystemExit(f"npm launcher version {npm_version!r} is not stable")
++
++    print(
++        f"Release metadata OK: Python {project_version} ({args.tag}), "
++        f"npm launcher {npm_version}"
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+-- 
+2.39.5
+
