@@ -62,6 +62,7 @@ from .processes import (
     HARD_KILL_SIGNAL,
     SESSION_BUFFER_BYTES,
     ExecSession,
+    _resolve_windows_pwsh,
     spawn_process,
     start_reader_threads,
     start_session_watchdog,
@@ -232,7 +233,7 @@ PATH_ARGUMENT_COMMANDS = {
     "wc",
 }
 PATTERN_THEN_PATH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "sed", "awk"}
-SCRIPT_COMMANDS = {"bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"}
+SCRIPT_COMMANDS = {"bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl", "pwsh", "powershell"}
 ENV_OPTIONS_WITH_ARGUMENT = {
     "-u",
     "--unset",
@@ -641,7 +642,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "exec_command": ToolSpec(
         title="Execute command",
-        description="Run a bounded command in the workspace under runtime policy.",
+        description="Run a bounded command. Prefer argv for direct executables and powershell_script for complex PowerShell to avoid shell quoting loss.",
         destructive=True,
         open_world=True,
         error_status="failed",
@@ -2572,28 +2573,111 @@ class Runtime:
 
     def exec_command(self, args: dict[str, Any]) -> dict[str, Any]:
         self._prune_sessions()
-        cmd = str(args.get("cmd", ""))
-        if not cmd:
-            raise ToolFailure("INVALID_ARGUMENT", "cmd is required.", category="validation")
+        cmd_value = args.get("cmd")
+        argv_value = args.get("argv")
+        powershell_script_value = args.get("powershell_script")
+        supplied_forms = [
+            name
+            for name, value in (
+                ("cmd", cmd_value),
+                ("argv", argv_value),
+                ("powershell_script", powershell_script_value),
+            )
+            if value is not None
+        ]
+        if len(supplied_forms) != 1:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "Provide exactly one execution form: cmd, argv, or powershell_script.",
+                category="validation",
+                details={"provided": supplied_forms},
+            )
+        if "script_args" in args and powershell_script_value is None:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "script_args is only valid with powershell_script.",
+                category="validation",
+            )
         workdir_arg = args.get("workdir", args.get("cwd", "."))
         if "workdir" in args and "cwd" in args and str(args["workdir"]) != str(args["cwd"]):
             raise ToolFailure("INVALID_ARGUMENT", "workdir and cwd refer to different directories.", category="validation")
         workdir = self.resolve_existing(str(workdir_arg))
         if not workdir.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
-        self._check_command_policy(cmd, args)
         timeout_ms = int(args.get("timeout_ms", 30000))
         yield_ms = int(args.get("yield_time_ms", 10000))
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
         env = self._command_env(args.get("env", {}))
+        execution_mode: str
+        cleanup_paths: list[Path] = []
+        if cmd_value is not None:
+            cmd = str(cmd_value)
+            if not cmd:
+                raise ToolFailure("INVALID_ARGUMENT", "cmd must be a non-empty string.", category="validation")
+            self._check_command_policy(cmd, args)
+            popen_cmd: Any = cmd
+            popen_shell = True
+            execution_mode = "shell"
+        elif argv_value is not None:
+            argv = self._validate_exec_argv(argv_value)
+            policy_text = " ".join(argv)
+            self._check_command_policy(policy_text, args, argv=argv, shell_semantics=False)
+            popen_cmd = argv
+            popen_shell = False
+            execution_mode = "argv"
+        else:
+            script = str(powershell_script_value or "")
+            if not script:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "powershell_script must be a non-empty string.",
+                    category="validation",
+                )
+            if len(script.encode("utf-8")) > MAX_HTTP_REQUEST_BYTES:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "powershell_script exceeds the 1 MiB execution-source limit.",
+                    category="validation",
+                )
+            script_args = self._validate_exec_argv(
+                args.get("script_args", []), allow_empty=True, field="script_args"
+            )
+            self._check_command_policy(script, args, force_inline_script=True)
+            pwsh = _resolve_windows_pwsh(cwd=str(workdir.path), env=env)
+            self._ensure_runtime_dirs()
+            script_dir = self.tmp_dir / "powershell-scripts"
+            try:
+                script_dir.mkdir(parents=True, exist_ok=True)
+                fd, raw_script_path = tempfile.mkstemp(prefix="exec-", suffix=".ps1", dir=script_dir)
+                script_path = Path(raw_script_path)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(script)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                raise ToolFailure(
+                    "RUNTIME_DIR_UNWRITABLE",
+                    "Could not stage the PowerShell script in the runtime directory.",
+                    category="runtime",
+                ) from exc
+            cleanup_paths.append(script_path)
+            popen_cmd = [
+                pwsh,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(script_path),
+                *script_args,
+            ]
+            popen_shell = False
+            execution_mode = "powershell_script"
         start = time.time()
         deadline = start + (timeout_ms / 1000.0)
         landlock_fd: int | None = None
         landlock_warning: str | None = None
-        popen_cmd: Any = cmd
-        popen_shell = True
         popen_extra = process_group_popen_kwargs()
         if self.landlock_enabled():
             try:
@@ -2603,21 +2687,24 @@ class Runtime:
                     write_roots=self.landlock_write_roots(),
                     additional_workspaces=list(self.workspace.roots[1:]),
                 )
-                popen_cmd = landlock_exec_argv(landlock_fd, cmd)
+                popen_cmd = landlock_exec_argv(landlock_fd, popen_cmd, shell=popen_shell)
                 popen_shell = False
                 popen_extra["pass_fds"] = (landlock_fd,)
             except ToolFailure as exc:
                 if exc.code != "SANDBOX_UNAVAILABLE":
+                    self._cleanup_exec_paths(cleanup_paths)
                     raise
                 landlock_warning = landlock_unavailable_warning(exc)
         with self.sessions_lock:
             if self._closed:
                 if landlock_fd is not None:
                     os.close(landlock_fd)
+                self._cleanup_exec_paths(cleanup_paths)
                 raise ToolFailure("SESSION_CLOSED", "Runtime is closed.", category="runtime")
             if len(self.sessions) + self.starting_sessions >= MAX_ACTIVE_EXEC_SESSIONS:
                 if landlock_fd is not None:
                     os.close(landlock_fd)
+                self._cleanup_exec_paths(cleanup_paths)
                 raise ToolFailure(
                     "SESSION_LIMIT_REACHED",
                     "Too many commands are already running or starting.",
@@ -2644,6 +2731,7 @@ class Runtime:
                 timeout_at=deadline,
                 warnings=[landlock_warning] if landlock_warning else None,
                 pty_master_fd=pty_master_fd,
+                cleanup_paths=cleanup_paths,
             )
             with self.sessions_lock:
                 self.starting_sessions -= 1
@@ -2659,6 +2747,7 @@ class Runtime:
                     self.starting_sessions -= 1
             if process is not None and process.poll() is None:
                 terminate_process_group(process, signal.SIGTERM)
+            self._cleanup_exec_paths(cleanup_paths)
             raise
         finally:
             if landlock_fd is not None:
@@ -2689,6 +2778,7 @@ class Runtime:
             # terminated/timeout) so exec, polling, and kill paths agree.
             payload = session.snapshot_since_cursor(max_output_bytes)
             payload["elapsed_ms"] = int((time.time() - start) * 1000)
+            payload["execution_mode"] = execution_mode
             self._add_exec_diagnostics(payload)
             return self._format_session_output(session, payload, args)
 
@@ -2713,10 +2803,48 @@ class Runtime:
                 return finish()
             time.sleep(0.02)
 
-    def _check_command_policy(self, cmd: str, args: dict[str, Any]) -> None:
+    def _validate_exec_argv(
+        self,
+        value: Any,
+        *,
+        allow_empty: bool = False,
+        field: str = "argv",
+    ) -> list[str]:
+        if not isinstance(value, list):
+            raise ToolFailure("INVALID_ARGUMENT", f"{field} must be an array of strings.", category="validation")
+        if not value and not allow_empty:
+            raise ToolFailure("INVALID_ARGUMENT", f"{field} must contain at least one item.", category="validation")
+        if len(value) > 256:
+            raise ToolFailure("INVALID_ARGUMENT", f"{field} cannot contain more than 256 items.", category="validation")
+        if any(not isinstance(item, str) for item in value):
+            raise ToolFailure("INVALID_ARGUMENT", f"{field} must contain only strings.", category="validation")
+        if value and not value[0]:
+            raise ToolFailure("INVALID_ARGUMENT", f"{field}[0] must be non-empty.", category="validation")
+        return list(value)
+
+    def _cleanup_exec_paths(self, paths: list[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _check_command_policy(
+        self,
+        cmd: str,
+        args: dict[str, Any],
+        *,
+        argv: list[str] | None = None,
+        shell_semantics: bool = True,
+        force_inline_script: bool = False,
+    ) -> None:
+        self._reject_windows_powershell_51(cmd, argv=argv)
         if self.dangerously_skip_all_permissions:
             return
-        self._check_command_paths(cmd)
+        if argv is None:
+            self._check_command_paths(cmd)
+        else:
+            self._check_argv_paths(argv)
         env = args.get("env", {})
         if isinstance(env, dict) and any(
             is_filtered_env_var(str(key), str(value)) for key, value in env.items()
@@ -2728,7 +2856,11 @@ class Runtime:
                 details={"permission": "sensitive_env", "env_keys": sorted(str(key) for key in env)},
             )
         if not self.capabilities.inline_script:
-            inline_script = inline_script_command(cmd)
+            inline_script = (
+                {"command": "pwsh", "option": "-File"}
+                if force_inline_script
+                else inline_script_segment(argv[0], argv[1:]) if argv else inline_script_command(cmd)
+            )
             if inline_script is not None:
                 raise ToolFailure(
                     "PERMISSION_REQUIRED",
@@ -2737,14 +2869,19 @@ class Runtime:
                     details={"permission": INLINE_SCRIPT_PERMISSION, **inline_script},
                 )
         compact = " ".join(cmd.split()).lower()
-        if not self.capabilities.shell_expansion and SHELL_EXPANSION_RE.search(cmd):
+        if shell_semantics and not self.capabilities.shell_expansion and SHELL_EXPANSION_RE.search(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Shell command substitution and parameter expansion require explicit permission.",
                 category="permission",
                 details={"permission": "shell_expansion", "command": compact},
             )
-        if os.name == "nt" and not self.capabilities.shell_expansion and POWERSHELL_DYNAMIC_RE.search(cmd):
+        if (
+            shell_semantics
+            and os.name == "nt"
+            and not self.capabilities.shell_expansion
+            and POWERSHELL_DYNAMIC_RE.search(cmd)
+        ):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Dynamic PowerShell invocation, variables, and splatting require explicit shell-expansion permission.",
@@ -2780,6 +2917,34 @@ class Runtime:
                 category="permission",
                 details={"permission": "network", "command": compact},
             )
+
+    def _check_argv_paths(self, argv: list[str]) -> None:
+        executable = argv[0]
+        self._reject_setuid_executable(executable)
+        for candidate in command_argument_path_candidates(executable, argv[1:]):
+            self._check_command_path_candidate(candidate)
+
+    def _reject_windows_powershell_51(self, cmd: str, *, argv: list[str] | None = None) -> None:
+        if os.name != "nt":
+            return
+        executables: list[str]
+        if argv is not None:
+            executables = [argv[0]]
+        else:
+            scannable = strip_heredoc_payloads(cmd)
+            try:
+                executables = command_executables(shlex_split(scannable))
+            except ValueError:
+                executables = command_executables(scannable.split())
+        for executable in executables:
+            name = PurePosixPath(executable.replace("\\", "/")).name.lower()
+            if name in {"powershell", "powershell.exe"}:
+                raise ToolFailure(
+                    "SHELL_VERSION_UNSUPPORTED",
+                    "Windows PowerShell 5.1 is disabled; use PowerShell 7 (pwsh.exe).",
+                    category="runtime",
+                    details={"executable": executable},
+                )
 
     def _add_exec_diagnostics(self, payload: dict[str, Any]) -> None:
         diagnostics = exec_output_diagnostics(payload)
@@ -2969,6 +3134,7 @@ class Runtime:
         timeout_at: float | None = None,
         warnings: list[str] | None = None,
         pty_master_fd: int | None = None,
+        cleanup_paths: list[Path] | None = None,
     ) -> ExecSession:
         return ExecSession(
             session_id=secrets.token_urlsafe(18),
@@ -2976,6 +3142,7 @@ class Runtime:
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
+            cleanup_paths=list(cleanup_paths or []),
         )
 
     def _remember_output_session(self, session: ExecSession) -> None:
@@ -3910,7 +4077,7 @@ def explicit_command_path_candidates(tokens: list[str]) -> list[str]:
 def command_argument_path_candidates(command: str | None, args: list[str]) -> list[str]:
     if not command:
         return []
-    name = PurePosixPath(command.replace("\\", "/")).name.lower()
+    name = PurePosixPath(command.replace("\\", "/")).name.lower().removesuffix(".exe")
     if name == "env":
         candidates, wrapped_command, wrapped_args = env_wrapped_command(args)
         if wrapped_command is not None:
@@ -3969,7 +4136,7 @@ def inline_script_command(command: str) -> dict[str, str] | None:
 def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str] | None:
     if not command:
         return None
-    name = PurePosixPath(command.replace("\\", "/")).name.lower()
+    name = PurePosixPath(command.replace("\\", "/")).name.lower().removesuffix(".exe")
     if name == "env":
         _candidates, wrapped_command, wrapped_args = env_wrapped_command(args)
         return inline_script_segment(wrapped_command, wrapped_args)
@@ -3990,6 +4157,14 @@ def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str
                 return {"command": name, "option": option}
     if name in {"ruby", "perl"} and "-e" in args:
         return {"command": name, "option": "-e"}
+    if name in {"pwsh", "powershell"}:
+        lowered = [arg.lower() for arg in args]
+        for option in ("-command", "-c", "-encodedcommand", "-e", "-ec", "-commandwithargs", "-cwa"):
+            if option in lowered:
+                return {"command": name, "option": option}
+        for index, option in enumerate(lowered[:-1]):
+            if option in {"-file", "-f"} and args[index + 1] == "-":
+                return {"command": name, "option": option}
     return None
 
 
@@ -4115,6 +4290,16 @@ def script_command_path_candidates(command_name: str, args: list[str]) -> list[s
         if command_name == "node" and arg in {"-e", "--eval", "-p", "--print"}:
             return []
         if command_name in {"ruby", "perl"} and arg == "-e":
+            return []
+        if command_name in {"pwsh", "powershell"} and arg.lower() in {
+            "-command",
+            "-c",
+            "-encodedcommand",
+            "-e",
+            "-ec",
+            "-commandwithargs",
+            "-cwa",
+        }:
             return []
         if arg in {"-m", "--require", "-r"}:
             skip_next = True
@@ -4428,9 +4613,13 @@ def landlock_path_allowed_access(path: Path) -> int:
     )
 
 
-def landlock_exec_argv(ruleset_fd: int, cmd: str) -> list[str]:
+def landlock_exec_argv(ruleset_fd: int, command: str | list[str], *, shell: bool = True) -> list[str]:
     helper = Path(__file__).with_name("landlock_exec.py")
-    return [sys.executable, str(helper), str(ruleset_fd), cmd]
+    if shell:
+        return [sys.executable, str(helper), str(ruleset_fd), "--shell", str(command)]
+    if not isinstance(command, list) or not command:
+        raise ValueError("direct Landlock execution requires a non-empty argv list")
+    return [sys.executable, str(helper), str(ruleset_fd), "--argv", *command]
 
 
 def is_default_system_path_root(resolved: Path) -> bool:
@@ -4896,9 +5085,34 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             ["query"],
         ),
         "apply_patch": object_schema({"patch": {**string, "minLength": 1}, "dry_run": {**boolean, "default": False}}, ["patch"]),
-        "exec_command": object_schema(
-            {
-                "cmd": {**string, "minLength": 1},
+        "exec_command": {
+            **object_schema(
+                {
+                "cmd": {
+                    **string,
+                    "minLength": 1,
+                    "description": "Legacy shell command string. On Windows it runs under PowerShell 7. Prefer argv or powershell_script when quoting is non-trivial.",
+                },
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "description": "Preferred direct executable invocation. Each argument is passed as a distinct process argument with shell parsing disabled.",
+                },
+                "powershell_script": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": 1048576,
+                    "description": "PowerShell source staged to a temporary .ps1 and executed with PowerShell 7 -File to avoid nested -Command quoting.",
+                },
+                "script_args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 256,
+                    "default": [],
+                    "description": "Separate process arguments passed after the temporary .ps1 path; valid only with powershell_script. Normal PowerShell script parameter binding still applies.",
+                },
                 "workdir": {**string, "default": "."},
                 "cwd": {**string},
                 "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
@@ -4909,9 +5123,14 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "stdin": {**string, "default": ""},
                 "tty": {**boolean, "default": False},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
-            },
-            ["cmd"],
-        ),
+                },
+            ),
+            "oneOf": [
+                {"required": ["cmd"]},
+                {"required": ["argv"]},
+                {"required": ["powershell_script"]},
+            ],
+        },
         "write_stdin": object_schema(
             {
                 "session_id": {**string, "minLength": 1},

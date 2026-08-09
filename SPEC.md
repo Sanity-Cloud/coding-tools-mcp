@@ -53,7 +53,9 @@ reported explicitly rather than hidden.
 
 Command sessions use a 10-second default yield, real POSIX PTYs, bounded active
 and retained-session stores, per-session and runtime output budgets, TTL cleanup,
-and explicit `next_action` objects for polling or truncated output.
+and explicit `next_action` objects for polling or truncated output. `exec_command`
+supports legacy shell strings, direct argv execution with shell parsing disabled,
+and staged PowerShell 7 scripts for quote-sensitive or multiline PowerShell.
 
 ## Security boundary
 

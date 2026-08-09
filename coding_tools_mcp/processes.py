@@ -234,6 +234,7 @@ class ExecSession:
     timed_out: bool = False
     terminating: bool = False
     pty_master_fd: int | None = None
+    cleanup_paths: list[Path] = field(default_factory=list)
     _stdin_closed: bool = False
 
     @property
@@ -366,6 +367,16 @@ class ExecSession:
         self.closed = True
         if self.completed_at is None:
             self.completed_at = time.time()
+            self._cleanup_paths()
+
+    def _cleanup_paths(self) -> None:
+        paths = self.cleanup_paths
+        self.cleanup_paths = []
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def drain_readers(self, timeout: float = 0.2) -> None:
         deadline = time.time() + timeout

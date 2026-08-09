@@ -21,7 +21,7 @@ The default catalog contains exactly 22 tools:
   controls.
 - `search_text`: literal or regex search; ripgrep stops after the result cap.
 - `apply_patch`: stage and atomically commit add/update/delete/move envelopes.
-- `exec_command`: run a bounded command and wait up to 10 seconds by default.
+- `exec_command`: run a bounded command using one of three mutually exclusive forms: legacy `cmd`, direct `argv`, or staged `powershell_script`.
 - `write_stdin`: poll or interact with a running command session.
 - `kill_session`: terminate one runtime-owned command session.
 - `read_output`: page retained stdout or stderr using absolute byte offsets.
@@ -88,6 +88,18 @@ Mode bits, BOM, and newline style are preserved; moves inherit source mode.
 commands ordinarily return `status: "exited"` in one call. A still-running
 command returns a `session_id` and machine-readable `next_action` for
 `write_stdin` with empty `chars`.
+
+`exec_command` accepts exactly one execution form. Prefer `argv` for native
+executables because arguments bypass shell parsing. On Windows, legacy `cmd`
+continues to run under PowerShell 7 for compatibility. Use `powershell_script`
+for multiline, variable-heavy, nested-quote, or embedded-code PowerShell; the
+server stages UTF-8 source in its private runtime directory and invokes
+`pwsh.exe -NoLogo -NoProfile -NonInteractive -File <temp.ps1>`. `script_args`
+are distinct process arguments rather than text interpolated into the script;
+normal PowerShell script parameter binding still applies to them.
+Temporary script files are deleted when their command session completes.
+Windows PowerShell 5.1 (`powershell.exe`) is rejected rather than used as a
+fallback.
 
 Only truncated terminal output returns a `read_output` next action by default.
 `output_ref` values are `session:<id>:stdout` or `session:<id>:stderr`; offsets

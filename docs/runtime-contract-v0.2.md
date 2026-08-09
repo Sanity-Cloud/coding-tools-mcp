@@ -271,13 +271,24 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 
 ### exec_command
 
-Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
+Inputs: `"cmd"`, `"argv"`, `"powershell_script"`, `"script_args"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
 
 Annotations: `{"title":"Execute command","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}`.
 
 Statuses are `exited`, `running`, `timeout`, `terminated`, or `failed`.
 Launch/policy failures use the error envelope with `status: "failed"`; signal
 exits use `terminated`. Ordinary non-zero exit codes still use `exited`.
+
+Exactly one execution form is required. `cmd` is the backward-compatible shell
+string form; on Windows it is hosted by PowerShell 7. `argv` executes a process
+with shell parsing disabled and preserves each array element as one process
+argument. `powershell_script` stages UTF-8 source into the runtime directory and
+executes it through PowerShell 7 `-File`; optional `script_args` follow the
+script path as separate arguments and retain normal PowerShell script parameter
+binding semantics. Completed sessions remove their staged
+PowerShell source. Windows PowerShell 5.1 is not an execution fallback. Success
+payloads report the selected `execution_mode` as `shell`, `argv`, or
+`powershell_script`.
 
 ### write_stdin
 

@@ -50,6 +50,7 @@ class ProjectContext:
         sections = [
             "Use these tools only for coding operations inside the configured workspace.",
             "Use apply_patch for code edits. Use receive_file only for complete-file transfer/handoff writes; do not modify files through exec_command.",
+            "For exec_command, prefer argv for direct executables. Use powershell_script for multiline, variable-heavy, or nested-quote PowerShell; reserve cmd for simple shell syntax.",
         ]
         for item in self.root_files:
             suffix = " [truncated]" if item.truncated else ""
