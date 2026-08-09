@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import ctypes
 import hashlib
 import html
@@ -578,6 +579,23 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "read_file": ToolSpec(
         title="Read file",
         description="Read a UTF-8 text file slice inside the configured workspace.",
+        read_only=True,
+        idempotent=True,
+    ),
+    "receive_file": ToolSpec(
+        title="Receive file",
+        description=(
+            "Receive a complete UTF-8 or base64 file payload and write it inside the configured workspace "
+            "with optional SHA-256 verification and overwrite protection."
+        ),
+        destructive=True,
+    ),
+    "export_project_file": ToolSpec(
+        title="Export project file",
+        description=(
+            "Export a bounded UTF-8 or base64 payload from an explicitly selected workspace file with "
+            "full-file SHA-256 metadata and sensitive-file protection."
+        ),
         read_only=True,
         idempotent=True,
     ),
@@ -1544,7 +1562,7 @@ class Runtime:
             warnings.append("permission_mode=dangerous disables MCP safety gates")
         if self.fake_readonly_annotations:
             warnings.append(
-                "tools/list annotations are faked as read-only; apply_patch and exec_command still mutate and execute"
+                "tools/list annotations are faked as read-only; receive_file and apply_patch still mutate, and exec_command still executes"
             )
         return {
             "ok": True,
@@ -1683,6 +1701,203 @@ class Runtime:
                     "path": requested_path,
                     "start_line": next_start_line,
                     "max_bytes": max_bytes,
+                },
+            }
+        return result
+
+    def receive_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        requested_path = str(args.get("path", ""))
+        mode_provided = "mode" in args
+        mode = str(args.get("mode", "rewrite"))
+        encoding = str(args.get("encoding", "base64"))
+        raw_content = args.get("content")
+        if not isinstance(raw_content, str):
+            raise ToolFailure("INVALID_ARGUMENT", "content must be a string.", category="validation")
+
+        if encoding == "utf8":
+            payload = raw_content.encode("utf-8")
+        elif encoding == "base64":
+            try:
+                payload = base64.b64decode(raw_content, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ToolFailure("INVALID_BASE64", "content is not valid base64.", category="validation") from exc
+        else:
+            raise ToolFailure("UNSUPPORTED_ENCODING", "encoding must be utf8 or base64.", category="validation")
+
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        expected_sha256 = args.get("expected_sha256")
+        if isinstance(expected_sha256, str) and expected_sha256.lower() != actual_sha256:
+            raise ToolFailure(
+                "SHA256_MISMATCH",
+                f"SHA-256 mismatch for {requested_path}.",
+                category="conflict",
+                details={"expected_sha256": expected_sha256.lower(), "actual_sha256": actual_sha256},
+            )
+
+        resolved = self.resolve_for_write(requested_path)
+        if resolved.existed and resolved.path.is_dir():
+            raise ToolFailure("IS_DIRECTORY", "Path is a directory.", category="validation")
+        if not mode_provided and resolved.existed and resolved.path.stat().st_size > 0:
+            raise ToolFailure(
+                "MODE_REQUIRED_FOR_EXISTING_FILE",
+                "Existing non-empty file requires explicit mode='rewrite' or mode='append'.",
+                category="conflict",
+                details={"path": resolved.display, "size": resolved.path.stat().st_size},
+            )
+
+        create_parents = bool(args.get("create_parent_directories", False))
+        parent = resolved.path.parent
+        if not parent.exists():
+            if not create_parents:
+                raise ToolFailure(
+                    "PARENT_NOT_FOUND",
+                    "Parent directory does not exist; set create_parent_directories=true to create it.",
+                    category="not_found",
+                    details={"path": resolved.display},
+                )
+            parent.mkdir(parents=True, exist_ok=True)
+
+        if mode == "append":
+            with resolved.path.open("ab") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        elif mode == "rewrite":
+            fd, temp_name = tempfile.mkstemp(prefix=f".{resolved.path.name}.", suffix=".tmp", dir=str(parent))
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, resolved.path)
+            finally:
+                try:
+                    Path(temp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            raise ToolFailure("INVALID_ARGUMENT", "mode must be rewrite or append.", category="validation")
+
+        final_size = resolved.path.stat().st_size
+        return {
+            "path": resolved.display,
+            "file_path": str(resolved.path),
+            "file_name": resolved.path.name,
+            "encoding": encoding,
+            "mode": mode,
+            "sha256": actual_sha256,
+            "received_bytes": len(payload),
+            "byte_count": final_size,
+            "success": True,
+            "summary": (
+                f"Received {len(payload)} bytes and {('appended to' if mode == 'append' else 'wrote')} "
+                f"{resolved.display} (sha256={actual_sha256})."
+            ),
+        }
+
+    def export_project_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        requested_path = str(args.get("path", ""))
+        resolved = self.resolve_existing(requested_path)
+        if not resolved.path.is_file():
+            raise ToolFailure("NOT_A_FILE", "Path is not a file.", category="validation")
+
+        basename = resolved.path.name.lower()
+        sensitive_patterns = (
+            ".env",
+            ".env.*",
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ed25519",
+            "*.pem",
+            "*.key",
+            "*.p12",
+            "*.pfx",
+            "credentials.json",
+            "token.json",
+            "tokens.json",
+            "secrets.json",
+            "secret.json",
+            "firebase-adminsdk*.json",
+            "service-account*.json",
+        )
+        safe_examples = {".env.example", ".env.sample", ".env.template"}
+        is_sensitive = basename not in safe_examples and any(
+            fnmatch.fnmatch(basename, pattern) for pattern in sensitive_patterns
+        )
+        if is_sensitive and not bool(args.get("allow_sensitive_project_file", False)):
+            raise ToolFailure(
+                "SENSITIVE_FILE_REQUIRES_EXPLICIT_ALLOW",
+                "This looks like a sensitive project file. Explicitly allow this exact file before exporting it.",
+                category="security",
+                details={"path": resolved.display},
+            )
+
+        encoding = str(args.get("encoding", "utf8"))
+        if encoding not in {"utf8", "base64"}:
+            raise ToolFailure("UNSUPPORTED_ENCODING", "encoding must be utf8 or base64.", category="validation")
+        offset = int(args.get("offset", 0))
+        max_bytes = int(args.get("max_bytes", 1_048_576))
+        include_content = bool(args.get("include_content", True))
+        byte_count = resolved.path.stat().st_size
+        bounded_offset = min(offset, byte_count)
+
+        digest = hashlib.sha256()
+        with resolved.path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1_048_576)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            handle.seek(bounded_offset)
+            selected = handle.read(max_bytes)
+        actual_sha256 = digest.hexdigest()
+        returned_bytes = len(selected)
+        truncated = bounded_offset + returned_bytes < byte_count
+
+        content: str | None = None
+        warnings: list[str] = []
+        if include_content:
+            if encoding == "base64":
+                content = base64.b64encode(selected).decode("ascii")
+            else:
+                content = selected.decode("utf-8", errors="replace")
+                if "\ufffd" in content:
+                    warnings.append(
+                        "UTF-8 replacement characters were required; use encoding=base64 for binary-safe export"
+                    )
+        if truncated:
+            warnings.append("content truncated")
+
+        result = {
+            "path": resolved.display,
+            "file_path": str(resolved.path),
+            "file_name": resolved.path.name,
+            "file_type": mimetypes.guess_type(resolved.path.name)[0] or "application/octet-stream",
+            "content": content,
+            "encoding": encoding,
+            "sha256": actual_sha256,
+            "byte_count": byte_count,
+            "returned_bytes": returned_bytes,
+            "offset": bounded_offset,
+            "truncated": truncated,
+            "success": True,
+            "warnings": warnings,
+            "summary": (
+                f"Exported {resolved.display} ({byte_count} bytes total, {returned_bytes} bytes returned, "
+                f"encoding={encoding}, sha256={actual_sha256}{', truncated' if truncated else ''})."
+            ),
+        }
+        if truncated:
+            result["next_action"] = {
+                "tool": "export_project_file",
+                "arguments": {
+                    "path": requested_path,
+                    "encoding": encoding,
+                    "offset": bounded_offset + returned_bytes,
+                    "max_bytes": max_bytes,
+                    "allow_sensitive_project_file": bool(args.get("allow_sensitive_project_file", False)),
+                    "include_content": include_content,
                 },
             }
         return result
@@ -4411,7 +4626,7 @@ def tool_annotations(name: str, *, fake_readonly: bool = False) -> dict[str, Any
     ``fake_readonly`` serves clients that refuse to call, or prompt on every call
     to, a tool annotated as mutating, which no server-side permission mode can
     influence. It reports every tool as read-only and non-destructive even though
-    `apply_patch` and `exec_command` still mutate and still execute. Only
+    `receive_file` and `apply_patch` still mutate and `exec_command` still executes. Only
     `tools/list` may pass it: `server_info` and the server card must keep
     reporting the real annotations so the override stays discoverable.
     """
@@ -4458,6 +4673,28 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "max_lines": {**integer, "minimum": 1},
                 "max_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 131072},
                 "encoding": {**string, "enum": ["utf-8"], "default": "utf-8"},
+            },
+            ["path"],
+        ),
+        "receive_file": object_schema(
+            {
+                "path": {**string, "minLength": 1},
+                "content": string,
+                "encoding": {**string, "enum": ["utf8", "base64"], "default": "base64"},
+                "mode": {**string, "enum": ["rewrite", "append"]},
+                "expected_sha256": {**string, "pattern": "^[A-Fa-f0-9]{64}$"},
+                "create_parent_directories": {**boolean, "default": False},
+            },
+            ["path", "content"],
+        ),
+        "export_project_file": object_schema(
+            {
+                "path": {**string, "minLength": 1},
+                "encoding": {**string, "enum": ["utf8", "base64"], "default": "utf8"},
+                "offset": {**integer, "minimum": 0, "default": 0},
+                "max_bytes": {**integer, "minimum": 1, "maximum": 10485760, "default": 1048576},
+                "allow_sensitive_project_file": {**boolean, "default": False},
+                "include_content": {**boolean, "default": True},
             },
             ["path"],
         ),
@@ -5356,7 +5593,7 @@ def build_runtime(
     if emit_warning and runtime.fake_readonly_annotations:
         print(
             "WARNING: tools/list reports every tool as read-only and non-destructive. "
-            "apply_patch and exec_command still mutate the workspace and still run commands. "
+            "receive_file and apply_patch still mutate the workspace, and exec_command still runs commands. "
             "server_info and the server card keep reporting the real annotations.",
             file=sys.stderr,
         )

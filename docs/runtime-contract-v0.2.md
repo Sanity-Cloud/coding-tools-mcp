@@ -6,8 +6,9 @@ Protocol target: MCP `2025-11-25`, with explicit compatibility for `2025-06-18`.
 
 This contract describes one stable, model-neutral coding tool set. There are no
 tool profiles and the server does not add or remove process tools dynamically.
-`apply_patch` is the only direct file-mutation primitive; `edit_file` is not
-provided. Permission modes alter command policy, not the advertised catalog.
+`apply_patch` is the code-edit primitive; `receive_file` is the bounded
+complete-file transfer/handoff primitive. `edit_file` is not provided.
+Permission modes alter command policy, not the advertised catalog.
 
 One switch, `--dangerously-fake-readonly-annotations`, rewrites the exposure hints
 in `tools/list` for clients that refuse mutating tools by annotation. It is not a
@@ -110,7 +111,7 @@ Tool failures keep the same envelope with `isError: true`, a readable error in
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SESSION_CLOSED", "SESSION_LIMIT_REACHED", "SESSION_NOT_FOUND", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
+["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "INVALID_BASE64", "IS_DIRECTORY", "MODE_REQUIRED_FOR_EXISTING_FILE", "NOT_A_DIRECTORY", "NOT_A_FILE", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PARENT_NOT_FOUND", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SENSITIVE_FILE_REQUIRES_EXPLICIT_ALLOW", "SESSION_CLOSED", "SESSION_LIMIT_REACHED", "SESSION_NOT_FOUND", "SHA256_MISMATCH", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
@@ -165,7 +166,7 @@ survive tunnel churn. Forwarded headers are ignored unless
 
 ## Stable tool inventory
 
-The default catalog has 20 tools, including `view_image`. Setting
+The default catalog has 22 tools, including `view_image`. Setting
 `CODING_TOOLS_MCP_ENABLE_VIEW_IMAGE=0` is the sole installation capability gate
 and removes only that optional binary-content tool. It is not a tool profile.
 
@@ -214,6 +215,27 @@ Annotations: `{"title":"Read file","readOnlyHint":true,"destructiveHint":false,"
 
 Reads UTF-8 ranges as a stream, reports full file line/byte metadata, rejects
 binary content, and returns continuation metadata when bounded.
+
+### receive_file
+
+Inputs: `"path"`, `"content"`, `"encoding"`, `"mode"`, `"expected_sha256"`, `"create_parent_directories"`.
+
+Annotations: `{"title":"Receive file","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}`.
+
+Receives a complete UTF-8 or binary-safe base64 payload inside the configured
+workspace. SHA-256 is calculated over the original received bytes. Existing
+non-empty files require an explicit `mode` (`rewrite` or `append`); rewrite uses
+a same-directory fsynced temporary file followed by atomic replacement.
+
+### export_project_file
+
+Inputs: `"path"`, `"encoding"`, `"offset"`, `"max_bytes"`, `"allow_sensitive_project_file"`, `"include_content"`.
+
+Annotations: `{"title":"Export project file","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Exports explicitly selected workspace files as bounded UTF-8 or base64 payloads,
+reports full-file SHA-256, supports offset continuation, and blocks common secret
+file names unless the caller explicitly allows that exact export.
 
 ### list_dir
 

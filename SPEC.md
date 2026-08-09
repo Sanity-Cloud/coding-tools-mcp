@@ -14,15 +14,16 @@ search, model routing, plugins, image generation, or subagent orchestration.
 
 There is one stable catalog. The runtime has no tool profiles, no `edit_file`,
 no dynamic `tools/list_changed`, and no required `open_workspace` call.
-`apply_patch` is the only direct file-write tool. `safe`, `trusted`, and
+`apply_patch` remains the code-edit primitive; `receive_file` is reserved for
+complete-file transfer/handoff writes. `safe`, `trusted`, and
 `dangerous` are command permission policies and never alter `tools/list`.
 
-The default catalog contains 20 tools:
+The default catalog contains 22 tools:
 
 - runtime/context: `server_info`, `check_exec_environment`, `get_default_cwd`,
   `set_default_cwd`
-- workspace inspection: `read_file`, `list_dir`, `list_files`, `search_text`
-- mutation: `apply_patch`
+- workspace inspection/transfer: `read_file`, `receive_file`, `export_project_file`, `list_dir`, `list_files`, `search_text`
+- mutation: `receive_file`, `apply_patch`
 - processes: `exec_command`, `write_stdin`, `read_output`, `kill_session`
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`
 - policy/image: `request_permissions`, `view_image`

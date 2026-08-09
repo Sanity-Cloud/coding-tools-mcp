@@ -6,7 +6,7 @@ properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The default catalog contains exactly 20 tools:
+The default catalog contains exactly 22 tools:
 
 - `server_info`: server, workspace, automatic project context, policy, runtime,
   auth, protocol, and fixed-catalog metadata.
@@ -14,6 +14,8 @@ The default catalog contains exactly 20 tools:
 - `get_default_cwd`: inspect this MCP runtime's relative-path base.
 - `set_default_cwd`: change this MCP runtime's relative-path base.
 - `read_file`: stream a bounded UTF-8 range without loading the whole file.
+- `receive_file`: receive a complete UTF-8 or binary-safe base64 payload with SHA-256 verification and guarded rewrite/append semantics.
+- `export_project_file`: export a bounded UTF-8 or base64 file payload with full-file SHA-256, continuation offsets, and sensitive-file protection.
 - `list_dir`: list immediate or bounded-recursive directory entries.
 - `list_files`: iterate files with glob, ignore, hidden-file, sort, and cap
   controls.
@@ -32,7 +34,7 @@ The default catalog contains exactly 20 tools:
 - `view_image`: one MCP image content block plus structured metadata.
 
 `view_image` may be disabled when an installation cannot accept binary image
-content. That capability gate is not a tool profile. The other 19 tools are
+content. That capability gate is not a tool profile. The other 21 tools are
 always advertised, and `listChanged` is `false`.
 
 ## Result envelope

@@ -28,6 +28,8 @@ REQUIRED_TOOLS = (
     "get_default_cwd",
     "set_default_cwd",
     "read_file",
+    "receive_file",
+    "export_project_file",
     "list_dir",
     "list_files",
     "search_text",

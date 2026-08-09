@@ -49,7 +49,7 @@ class ProjectContext:
     def server_instructions(self) -> str:
         sections = [
             "Use these tools only for coding operations inside the configured workspace.",
-            "Use apply_patch as the only direct file-modification tool; do not modify files through exec_command.",
+            "Use apply_patch for code edits. Use receive_file only for complete-file transfer/handoff writes; do not modify files through exec_command.",
         ]
         for item in self.root_files:
             suffix = " [truncated]" if item.truncated else ""
