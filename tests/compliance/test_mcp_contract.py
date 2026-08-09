@@ -108,6 +108,7 @@ class MCPContractTests(ComplianceTestCase):
             "check_exec_environment": (True, False, True, False),
             "get_default_cwd": (True, False, True, False),
             "set_default_cwd": (False, False, True, False),
+            "record_diagnostic": (False, False, False, False),
             "read_file": (True, False, True, False),
             "receive_file": (False, True, False, False),
             "export_project_file": (True, False, True, False),

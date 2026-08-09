@@ -166,7 +166,7 @@ survive tunnel churn. Forwarded headers are ignored unless
 
 ## Stable tool inventory
 
-The default catalog has 22 tools, including `view_image`. Setting
+The default catalog has 23 tools, including `view_image`. Setting
 `CODING_TOOLS_MCP_ENABLE_VIEW_IMAGE=0` is the sole installation capability gate
 and removes only that optional binary-content tool. It is not a tool profile.
 
@@ -198,6 +198,18 @@ Returns lightweight policy and Landlock status without running active probes.
 Inputs: none.
 
 Annotations: `{"title":"Get default cwd","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+### record_diagnostic
+
+Inputs: `"code"`, `"message"`, `"category"`, `"severity"`, `"kind"`, `"component"`,
+`"operation"`, `"retryable"`, `"related_paths"`, `"details"`.
+
+Annotations: `{"title":"Record diagnostic","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}`.
+
+Creates an operator-local, durable incident report and append-only diagnostic
+ledger entry for an error discovered during coding work. Automatic runtime
+failures use the same store. Raw command/file content and environment values are
+not persisted in diagnostic records.
 
 ### set_default_cwd
 

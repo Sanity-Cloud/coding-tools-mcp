@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added durable local diagnostic governance. Tool failures, invalid requests,
+  non-zero command exits, timeouts, abnormal command termination, and unexpected
+  internal exceptions now create structured incident reports and append-only
+  ledger entries with recurrence fingerprints and `diagnostic_receipt` metadata.
+- Added `record_diagnostic` for application, test, upstream-schema, workflow,
+  performance, or process defects discovered during otherwise successful coding
+  work. These incidents enter the shared `debug_and_performance_review` queue.
+- Diagnostic persistence is separate from anonymous telemetry and deliberately
+  omits raw command/file content, stdin, positional command arguments, and
+  environment values while redacting secret-like fields and token patterns.
+
 ## 0.2.2 - 2026-07-28
 
 ### Fixed

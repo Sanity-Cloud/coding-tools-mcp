@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from . import __version__
+from .diagnostics import DiagnosticRecorder, classify_failure
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .landlock_exec import libc_syscall
@@ -593,6 +594,13 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Set default cwd",
         description="Set the default cwd for relative tool paths inside the workspace.",
         idempotent=True,
+    ),
+    "record_diagnostic": ToolSpec(
+        title="Record diagnostic",
+        description=(
+            "Create a durable local incident report and diagnostic-ledger entry for an application, test, "
+            "workflow, schema, or process error discovered during coding work."
+        ),
     ),
     "read_file": ToolSpec(
         title="Read file",
@@ -1374,6 +1382,7 @@ class Runtime:
         self.request_context = threading.local()
         self.initialized = False
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
+        self.diagnostics = DiagnosticRecorder(self.workspace.root)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
     @property
@@ -1427,6 +1436,7 @@ class Runtime:
         session.request_sessions_lock = threading.Lock()
         session.request_context = threading.local()
         session.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport="http")
+        session.diagnostics = self.diagnostics
         session._tool_handlers = {name: getattr(session, name) for name in TOOL_REGISTRY}
         return session
 
@@ -1603,6 +1613,7 @@ class Runtime:
                 "nested_instruction_files": list(self.project_context.nested_files),
                 "warnings": list(self.project_context.warnings),
             },
+            "diagnostics": self.diagnostics.summary(),
             "tools": tools,
             "tool_count": len(tools),
         }
@@ -1616,12 +1627,13 @@ class Runtime:
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
-        handler = self._tool_handlers.get(name) if name in self._exposed_tool_name_set else None
-        if handler is None:
-            raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
-        spec = TOOL_REGISTRY[name]
-        validate_arguments(name, args)
+        spec: ToolSpec | None = None
         try:
+            handler = self._tool_handlers.get(name) if name in self._exposed_tool_name_set else None
+            if handler is None:
+                raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
+            spec = TOOL_REGISTRY[name]
+            validate_arguments(name, args)
             self.request_context.request_id = request_id
             try:
                 payload = handler(args)
@@ -1631,9 +1643,34 @@ class Runtime:
                         self.request_sessions.pop(request_id, None)
                 self.request_context.request_id = None
             payload.setdefault("ok", True)
+            self._attach_diagnostic_receipt(name, args, payload, started_at, request_id=request_id)
             self.emit_tool_trace(name, args, payload, started_at)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
+        except JsonRpcError as exc:
+            error_code = (
+                str(exc.data.get("code") or "INVALID_REQUEST")
+                if isinstance(exc.data, dict)
+                else "INVALID_REQUEST"
+            )
+            classification = {
+                "kind": "request_error",
+                "code": error_code,
+                "category": "validation",
+                "message": exc.message,
+                "retryable": False,
+                "severity": "error",
+            }
+            self.diagnostics.record(
+                tool_name=name,
+                args=args,
+                payload={"ok": False, "error": {"code": error_code, "message": exc.message}},
+                started_at=started_at,
+                request_id=request_id,
+                exception=exc,
+                classification=classification,
+            )
+            raise
         except ToolFailure as exc:
             payload = {
                 "ok": False,
@@ -1645,7 +1682,7 @@ class Runtime:
                     "details": exc.details,
                 },
             }
-            if spec.error_status:
+            if spec is not None and spec.error_status:
                 payload["status"] = spec.error_status
             diagnostics = permission_failure_diagnostics(exc)
             if diagnostics:
@@ -1660,6 +1697,14 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
+            self._attach_diagnostic_receipt(
+                name,
+                args,
+                payload,
+                started_at,
+                request_id=request_id,
+                exception=exc,
+            )
             self.emit_tool_trace(name, args, payload, started_at)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -1673,10 +1718,41 @@ class Runtime:
                     "details": {},
                 },
             }
-            if spec.error_status:
+            if spec is not None and spec.error_status:
                 payload["status"] = spec.error_status
+            self._attach_diagnostic_receipt(
+                name,
+                args,
+                payload,
+                started_at,
+                request_id=request_id,
+                exception=exc,
+            )
             self.emit_tool_trace(name, args, payload, started_at)
             return make_tool_result(name, payload, is_error=True)
+
+    def _attach_diagnostic_receipt(
+        self,
+        name: str,
+        args: dict[str, Any],
+        payload: dict[str, Any],
+        started_at: float,
+        *,
+        request_id: str | int | None = None,
+        exception: BaseException | None = None,
+    ) -> None:
+        classification = classify_failure(name, payload)
+        if classification is None:
+            return
+        payload["diagnostic_receipt"] = self.diagnostics.record(
+            tool_name=name,
+            args=args,
+            payload=payload,
+            started_at=started_at,
+            request_id=request_id,
+            exception=exception,
+            classification=classification,
+        )
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
@@ -1708,6 +1784,46 @@ class Runtime:
             "default_cwd": self.default_cwd_display(),
         }
 
+    def record_diagnostic(self, args: dict[str, Any]) -> dict[str, Any]:
+        code = str(args.get("code") or "DISCOVERED_ERROR").strip()
+        message = str(args.get("message") or "Discovered error.").strip()
+        category = str(args.get("category") or "workflow").strip()
+        severity = str(args.get("severity") or "error").strip().lower()
+        kind = str(args.get("kind") or "discovered_error").strip()
+        component = str(args.get("component") or "coding-workflow").strip()
+        operation = str(args.get("operation") or "diagnostic_observation").strip()
+        classification = {
+            "kind": kind,
+            "code": code,
+            "category": category,
+            "message": message,
+            "retryable": bool(args.get("retryable", False)),
+            "severity": severity,
+        }
+        receipt = self.diagnostics.record(
+            tool_name="record_diagnostic",
+            args={},
+            payload={"ok": False, "error": {"code": code, "message": message}},
+            started_at=time.time(),
+            request_id=getattr(self.request_context, "request_id", None),
+            classification=classification,
+            source="explicit_observation",
+            component=component,
+            operation=operation,
+            related_paths=[str(item) for item in (args.get("related_paths") or [])],
+            details=args.get("details") if isinstance(args.get("details"), dict) else {},
+        )
+        return {
+            "ok": bool(receipt.get("recorded")),
+            "status": "recorded" if receipt.get("recorded") else "not_recorded",
+            "summary": (
+                f"Diagnostic {receipt.get('incident_id', 'unknown')} recorded for {component}/{operation}."
+                if receipt.get("recorded")
+                else "Diagnostic could not be recorded."
+            ),
+            "diagnostic_receipt": receipt,
+        }
+
     def set_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
         if getattr(self, "_stateless_http", False):
             raise ToolFailure(
@@ -1729,10 +1845,15 @@ class Runtime:
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
+        classified_failure = classify_failure(name, payload)
+        trace_ok = classified_failure is None
+        trace_error_code = (
+            str(classified_failure.get("code")) if classified_failure is not None else error.get("code")
+        )
         self.telemetry.record_tool_call(
             name,
-            ok=bool(payload.get("ok")),
-            error_code=error.get("code"),
+            ok=trace_ok,
+            error_code=trace_error_code,
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
         )
@@ -1742,9 +1863,9 @@ class Runtime:
             "event": "tool_call",
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "tool": name,
-            "ok": bool(payload.get("ok", False)),
+            "ok": trace_ok,
             "status": payload.get("status"),
-            "error_code": error.get("code"),
+            "error_code": trace_error_code,
             "duration_ms": duration_ms,
             "session_id": payload.get("session_id"),
             "truncated": payload.get("truncated"),
@@ -5012,6 +5133,21 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "path": {**string, "default": "."},
             }
+        ),
+        "record_diagnostic": object_schema(
+            {
+                "code": {**string, "minLength": 1},
+                "message": {**string, "minLength": 1},
+                "category": {**string, "default": "workflow"},
+                "severity": {**string, "enum": ["warning", "error", "critical"], "default": "error"},
+                "kind": {**string, "default": "discovered_error"},
+                "component": {**string, "default": "coding-workflow"},
+                "operation": {**string, "default": "diagnostic_observation"},
+                "retryable": {**boolean, "default": False},
+                "related_paths": string_array,
+                "details": {"type": "object", "additionalProperties": True},
+            },
+            ["code", "message"],
         ),
         "read_file": object_schema(
             {

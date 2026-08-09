@@ -27,6 +27,7 @@ REQUIRED_TOOLS = (
     "check_exec_environment",
     "get_default_cwd",
     "set_default_cwd",
+    "record_diagnostic",
     "read_file",
     "receive_file",
     "export_project_file",

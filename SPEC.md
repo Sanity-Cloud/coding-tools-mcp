@@ -18,10 +18,11 @@ no dynamic `tools/list_changed`, and no required `open_workspace` call.
 complete-file transfer/handoff writes. `safe`, `trusted`, and
 `dangerous` are command permission policies and never alter `tools/list`.
 
-The default catalog contains 22 tools:
+The default catalog contains 23 tools:
 
 - runtime/context: `server_info`, `check_exec_environment`, `get_default_cwd`,
   `set_default_cwd`
+- diagnostics: `record_diagnostic`
 - workspace inspection/transfer: `read_file`, `receive_file`, `export_project_file`, `list_dir`, `list_files`, `search_text`
 - mutation: `receive_file`, `apply_patch`
 - processes: `exec_command`, `write_stdin`, `read_output`, `kill_session`
@@ -56,6 +57,28 @@ and retained-session stores, per-session and runtime output budgets, TTL cleanup
 and explicit `next_action` objects for polling or truncated output. `exec_command`
 supports legacy shell strings, direct argv execution with shell parsing disabled,
 and staged PowerShell 7 scripts for quote-sensitive or multiline PowerShell.
+
+## Diagnostic governance
+
+Errors are durable operating evidence, not disposable console noise. Every
+Coding Tools tool failure, invalid tool request, non-zero command exit, command
+timeout, and unexpected internal exception creates a local structured incident
+report plus an append-only diagnostic-ledger entry. The tool result carries a
+`diagnostic_receipt` with the incident id, fingerprint, report path, and ledger
+path when recording succeeds.
+
+Errors discovered *inside* otherwise successful coding work (for example a
+failed application assertion, upstream schema drift, persistent warning promoted
+to a defect, or a broken workflow observed in logs) must be recorded through
+`record_diagnostic`. These explicit observations enter the same ledger and the
+same `debug_and_performance_review` queue.
+
+Diagnostic records are local and durable, separate from anonymous telemetry.
+They omit raw command output, file/patch contents, command bodies, stdin, and
+environment values; secret-like fields and token patterns are redacted. The
+default store is the platform-local state directory and can be redirected with
+`CODING_TOOLS_MCP_DIAGNOSTIC_DIR`. Setting
+`CODING_TOOLS_MCP_DIAGNOSTICS=off` explicitly disables recording.
 
 ## Security boundary
 
