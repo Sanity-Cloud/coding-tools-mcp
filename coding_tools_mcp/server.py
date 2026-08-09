@@ -180,11 +180,28 @@ NETWORK_RE = re.compile(
     re.I,
 )
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
+POWERSHELL_NETWORK_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|"
+    r"Test-NetConnection|Test-Connection|Resolve-DnsName|iwr|irm|tnc|ping(?:\.exe)?|"
+    r"nslookup(?:\.exe)?|tracert(?:\.exe)?)\b|(?:System\.)?Net\.",
+    re.I,
+)
+POWERSHELL_DESTRUCTIVE_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:Remove-Item|ri|rm|del|erase|rmdir|rd)\b[^\r\n;&|]*"
+    r"(?:-Recurse\b|-r\b)",
+    re.I,
+)
+POWERSHELL_DYNAMIC_RE = re.compile(
+    r"(?:&\s*\$|@\{|(?:^|[\s;&|({])@[A-Za-z_]\w*|\$[A-Za-z_][\w:]*|\bInvoke-Expression\b|\biex\b|"
+    r"\[ScriptBlock\]::Create)",
+    re.I,
+)
 DESTRUCTIVE_RE = re.compile(
     r"(^|\s)(sudo|su|chmod\s+-R|chown\s+-R|mkfs|mount|umount|find\b[^;&|]*\s-delete\b|git\b[^;&|]*\breset\s+--hard\b|git\b[^;&|]*\bclean\s+-[^\s]*[fx][^\s]*|rm\s+-[^\s]*r[^\s]*f|rm\s+-[^\s]*f[^\s]*r)\b",
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
+STATELESS_HTTP_CLIENT_NAMES = frozenset({"openai-mcp"})
 EXEC_PREVIEW_BYTES = 4096
 MAX_ACTIVE_EXEC_SESSIONS = 16
 MAX_RETAINED_OUTPUT_SESSIONS = 32
@@ -1077,17 +1094,26 @@ class ResolvedPath:
 
 
 class Workspace:
-    def __init__(self, root: Path) -> None:
-        self.root = root.expanduser().resolve(strict=True)
-        if not self.root.is_dir():
-            raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation")
+    def __init__(self, root: Path, additional_roots: list[Path] | tuple[Path, ...] | None = None) -> None:
         unsafe_roots = {"/"}
         try:
             unsafe_roots.add(str(Path.home().resolve()))
         except RuntimeError:
             pass
-        if str(self.root) in unsafe_roots:
-            raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
+
+        configured: list[Path] = []
+        for raw_root in [root, *(additional_roots or [])]:
+            resolved_root = raw_root.expanduser().resolve(strict=True)
+            if not resolved_root.is_dir():
+                raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation")
+            if str(resolved_root) in unsafe_roots:
+                raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
+            if resolved_root not in configured:
+                configured.append(resolved_root)
+
+        self.root = configured[0]
+        self.roots = tuple(configured)
+        self.allow_absolute_paths = len(self.roots) > 1
         self.git_path = shutil.which("git")
 
     def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
@@ -1095,25 +1121,49 @@ class Workspace:
             raise ToolFailure("INVALID_ARGUMENT", "Path must be a non-empty string.", category="validation")
         if "\x00" in raw_path:
             raise ToolFailure("INVALID_ARGUMENT", "Path contains a NUL byte.", category="validation")
-        if raw_path.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", raw_path):
-            raise ToolFailure("ABSOLUTE_PATH_DENIED", "Absolute paths are denied.", category="security")
-        pure = PurePosixPath(raw_path)
+        normalized = raw_path.replace("\\", "/")
+        pure = PurePosixPath(normalized)
         if any(part == ".." for part in pure.parts):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         return pure
+
+    def _is_absolute_text(self, raw_path: str) -> bool:
+        return raw_path.startswith("/") or bool(re.match(r"^[A-Za-z]:[\\/]", raw_path)) or Path(raw_path).is_absolute()
+
+    def _candidate_path(self, base: Path, raw_path: str) -> Path:
+        pure = self._reject_unsafe_text(raw_path)
+        if self._is_absolute_text(raw_path):
+            if not self.allow_absolute_paths:
+                raise ToolFailure("ABSOLUTE_PATH_DENIED", "Absolute paths are denied.", category="security")
+            return Path(raw_path).expanduser()
+        return base.joinpath(*pure.parts)
+
+    def root_for_path(self, path: Path) -> Path | None:
+        try:
+            candidate = path.resolve(strict=False)
+        except OSError:
+            candidate = path.absolute()
+        if is_relative_to(candidate, self.root):
+            return self.root
+        matches = [root for root in self.roots[1:] if is_relative_to(candidate, root)]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: len(item.parts))
+
+    def is_allowed_path(self, path: Path) -> bool:
+        return self.root_for_path(path) is not None
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
         return self.resolve_existing_at(self.root, raw_path)
 
     def resolve_existing_at(self, base: Path, raw_path: str = ".") -> ResolvedPath:
-        pure = self._reject_unsafe_text(raw_path or ".")
         base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self._candidate_path(base, raw_path or ".")
         try:
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as exc:
             raise ToolFailure("NOT_FOUND", f"Path not found: {raw_path}", category="not_found") from exc
-        if not is_relative_to(resolved, self.root):
+        if not self.is_allowed_path(resolved):
             code = "SYMLINK_ESCAPE" if candidate.is_symlink() else "PATH_OUTSIDE_WORKSPACE"
             raise ToolFailure(code, "Path escapes the configured workspace.", category="security")
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
@@ -1126,10 +1176,10 @@ class Workspace:
         if pure.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
         base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self._candidate_path(base, raw_path)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
-            if not is_relative_to(resolved, self.root):
+            if not self.is_allowed_path(resolved):
                 raise ToolFailure("SYMLINK_ESCAPE", "Path escapes the configured workspace.", category="security")
             return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
@@ -1137,14 +1187,14 @@ class Workspace:
         missing: list[Path] = []
         while not parent.exists():
             missing.append(parent)
-            if parent == self.root or parent.parent == parent:
+            if parent in self.roots or parent.parent == parent:
                 break
             parent = parent.parent
         try:
             resolved_parent = parent.resolve(strict=True)
         except FileNotFoundError as exc:
             raise ToolFailure("NOT_FOUND", f"Parent directory not found: {raw_path}", category="not_found") from exc
-        if not is_relative_to(resolved_parent, self.root):
+        if not self.is_allowed_path(resolved_parent):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
         return ResolvedPath(normalize_rel_display(target, self.root), target, False)
@@ -1156,13 +1206,12 @@ class Workspace:
             raise ToolFailure("NOT_FOUND", "Default cwd path no longer exists.", category="not_found") from exc
         if not resolved.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "Default cwd is not a directory.", category="validation")
-        if not is_relative_to(resolved, self.root):
+        if not self.is_allowed_path(resolved):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Default cwd escapes the configured workspace.", category="security")
         return resolved
 
     def reject_write_symlink(self, raw_path: str) -> None:
-        pure = self._reject_unsafe_text(raw_path)
-        candidate = self.root.joinpath(*pure.parts)
+        candidate = self._candidate_path(self.root, raw_path)
         if candidate.is_symlink():
             raise ToolFailure("SYMLINK_ESCAPE", "Writing through symlinks is denied.", category="security")
 
@@ -1174,10 +1223,10 @@ class Workspace:
         include_ignored: bool = False,
         git_ignored: set[str] | None = None,
     ) -> bool:
-        try:
-            rel = path.relative_to(self.root)
-        except ValueError:
+        containing_root = self.root_for_path(path)
+        if containing_root is None:
             return True
+        rel = path.relative_to(containing_root)
         parts = rel.parts
         if not include_hidden and any(part.startswith(".") for part in parts if part not in {".", ""}):
             return True
@@ -1195,7 +1244,7 @@ class Workspace:
             resolved = path.resolve(strict=True)
         except FileNotFoundError:
             return False
-        return is_relative_to(resolved, self.root)
+        return self.is_allowed_path(resolved)
 
     def git_ignored_paths(self, rel_paths: list[str]) -> set[str]:
         if not rel_paths:
@@ -1203,10 +1252,21 @@ class Workspace:
         git = self.git_path
         if not git:
             return set()
+        primary_paths: list[str] = []
+        for rel_path in rel_paths:
+            candidate = Path(rel_path)
+            if candidate.is_absolute():
+                try:
+                    rel_path = candidate.relative_to(self.root).as_posix()
+                except ValueError:
+                    continue
+            primary_paths.append(rel_path)
+        if not primary_paths:
+            return set()
         try:
             completed = subprocess.run(
                 [git, "-C", str(self.root), "check-ignore", "--stdin", "-z"],
-                input="\0".join(rel_paths) + "\0",
+                input="\0".join(primary_paths) + "\0",
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -1219,11 +1279,20 @@ class Workspace:
         return {path for path in completed.stdout.split("\0") if path}
 
 
+@dataclass
+class SharedCommandState:
+    sessions: dict[str, ExecSession] = field(default_factory=dict)
+    output_sessions: dict[str, ExecSession] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    starting_sessions: int = 0
+
+
 class Runtime:
     def __init__(
         self,
         workspace: Path,
         *,
+        workspace_roots: list[Path] | tuple[Path, ...] | None = None,
         enable_view_image: bool = True,
         permission_mode: str = "safe",
         shell_env_policy: ShellEnvPolicy | None = None,
@@ -1231,10 +1300,11 @@ class Runtime:
         auth_token: str | None = None,
         oauth_config: OAuthConfig | None = None,
         project_context: ProjectContext | None = None,
+        command_state: SharedCommandState | None = None,
         fake_readonly_annotations: bool = False,
         transport: str = "stdio",
     ) -> None:
-        self.workspace = Workspace(workspace)
+        self.workspace = Workspace(workspace, workspace_roots)
         self.enable_view_image = enable_view_image
         self._exposed_tool_names = [
             name
@@ -1277,11 +1347,15 @@ class Runtime:
         self.server_instance_id = secrets.token_urlsafe(12)
         self._set_runtime_dir(runtime_dir_for_workspace(self.workspace.root, self.server_instance_id))
         self.fallback_runtime_dir = fallback_runtime_dir_for_workspace(self.workspace.root, self.server_instance_id)
+        self._owns_runtime_dir = True
         self.default_cwd = self.workspace.root
-        self.sessions: dict[str, ExecSession] = {}
-        self.output_sessions: dict[str, ExecSession] = {}
-        self.sessions_lock = threading.Lock()
-        self.starting_sessions = 0
+        self.command_state = command_state or SharedCommandState()
+        self._owns_command_state = command_state is None
+        # Compatibility aliases keep the public/internal session-handle API stable
+        # while command ownership is moved out of individual HTTP transport runtimes.
+        self.sessions = self.command_state.sessions
+        self.output_sessions = self.command_state.output_sessions
+        self.sessions_lock = self.command_state.lock
         self._closed = False
         self.http_session_id = secrets.token_urlsafe(24)
         self.protocol_version = PROTOCOL_VERSION
@@ -1301,26 +1375,78 @@ class Runtime:
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
+    @property
+    def starting_sessions(self) -> int:
+        return self.command_state.starting_sessions
+
+    @starting_sessions.setter
+    def starting_sessions(self, value: int) -> None:
+        self.command_state.starting_sessions = value
+
     def _set_runtime_dir(self, runtime_dir: Path) -> None:
         self.runtime_dir = runtime_dir
         self.home_dir = self.runtime_dir / "home"
         self.tmp_dir = self.runtime_dir / "tmp"
         self.cache_dir = self.runtime_dir / "cache"
 
+    def spawn_http_session_runtime(self) -> "Runtime":
+        """Create a lightweight HTTP transport view without rebuilding Runtime services.
+
+        Streamable HTTP clients may initialize a fresh transport for every tool
+        invocation. Re-running ``Runtime.__init__`` for each initialize needlessly
+        reconstructs workspace/configuration objects and creates disposable runtime
+        directories. A transport view shares immutable/server-scoped services and
+        command ownership while retaining only protocol/session-local mutable state.
+        """
+
+        session = object.__new__(Runtime)
+        session.__dict__ = self.__dict__.copy()
+
+        # Session-local protocol/navigation state.
+        session.default_cwd = self.workspace.root
+        session._closed = False
+        session.http_session_id = secrets.token_urlsafe(24)
+        session.protocol_version = PROTOCOL_VERSION
+        session.initialized = False
+
+        # Shared server/runtime services. The lightweight view must never tear
+        # these down when its HTTP transport expires or is LRU-evicted.
+        session.command_state = self.command_state
+        session._owns_command_state = False
+        session.sessions = self.command_state.sessions
+        session.output_sessions = self.command_state.output_sessions
+        session.sessions_lock = self.command_state.lock
+        session._owns_runtime_dir = False
+
+        # Mutable request/patch/telemetry state stays isolated per transport.
+        session.patch_baselines = {}
+        session.patch_lock = threading.Lock()
+        session.patch_committer = AtomicPatchCommitter()
+        session.request_sessions = {}
+        session.request_sessions_lock = threading.Lock()
+        session.request_context = threading.local()
+        session.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport="http")
+        session._tool_handlers = {name: getattr(session, name) for name in TOOL_REGISTRY}
+        return session
+
     def close(self) -> None:
         with self.sessions_lock:
             if self._closed:
                 return
             self._closed = True
-            sessions = list(self.sessions.values())
-            self.sessions.clear()
-            self.output_sessions.clear()
+            if self._owns_command_state:
+                sessions = list(self.sessions.values())
+                self.sessions.clear()
+                self.output_sessions.clear()
+            else:
+                sessions = []
         for session in sessions:
             session.refresh_status()
             if session.process.poll() is None:
                 terminate_process_group(session.process, signal.SIGTERM)
             session.drain_readers()
-        shutil.rmtree(self.runtime_dir, ignore_errors=True)
+        if getattr(self, "_owns_runtime_dir", True):
+            shutil.rmtree(self.runtime_dir, ignore_errors=True)
         self.telemetry.finish()
 
     def _ensure_runtime_dirs(self) -> None:
@@ -1434,6 +1560,7 @@ class Runtime:
     def _exec_environment_summary(self) -> dict[str, Any]:
         return {
             "workspace": str(self.workspace.root),
+            "workspace_roots": [str(root) for root in self.workspace.roots],
             "permission_mode": self.permission_mode,
             "network_allowed": self.allow_network,
             "runtime_dir": str(self.runtime_dir),
@@ -1576,16 +1703,24 @@ class Runtime:
     def get_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
         return {
             "workspace": str(self.workspace.root),
+            "workspace_roots": [str(root) for root in self.workspace.roots],
             "default_cwd": self.default_cwd_display(),
         }
 
     def set_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self, "_stateless_http", False):
+            raise ToolFailure(
+                "STATELESS_TRANSPORT",
+                "set_default_cwd is not persistent for stateless HTTP clients; pass cwd/workdir or absolute paths instead.",
+                category="validation",
+            )
         resolved = self.workspace.resolve_existing(str(args.get("path", ".")))
         if not resolved.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "Default cwd must be a directory.", category="validation")
         self.default_cwd = resolved.path
         return {
             "workspace": str(self.workspace.root),
+            "workspace_roots": [str(root) for root in self.workspace.roots],
             "default_cwd": resolved.display,
         }
 
@@ -2466,6 +2601,7 @@ class Runtime:
                     self.workspace.root,
                     guard_allow_roots(),
                     write_roots=self.landlock_write_roots(),
+                    additional_workspaces=list(self.workspace.roots[1:]),
                 )
                 popen_cmd = landlock_exec_argv(landlock_fd, cmd)
                 popen_shell = False
@@ -2608,6 +2744,13 @@ class Runtime:
                 category="permission",
                 details={"permission": "shell_expansion", "command": compact},
             )
+        if os.name == "nt" and not self.capabilities.shell_expansion and POWERSHELL_DYNAMIC_RE.search(cmd):
+            raise ToolFailure(
+                "PERMISSION_REQUIRED",
+                "Dynamic PowerShell invocation, variables, and splatting require explicit shell-expansion permission.",
+                category="permission",
+                details={"permission": "shell_expansion", "command": compact},
+            )
         if re.search(r"(^|[;&|]\s*)rm\s+(-[^\s]*r[^\s]*f|-?[^\s]*f[^\s]*r)\s+/", compact):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
@@ -2622,7 +2765,15 @@ class Runtime:
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if not self.allow_network and NETWORK_RE.search(cmd) and not is_literal_network_reference_command(cmd):
+        if os.name == "nt" and POWERSHELL_DESTRUCTIVE_RE.search(cmd):
+            raise ToolFailure(
+                "PERMISSION_REQUIRED",
+                "Recursive PowerShell deletion is blocked without explicit permission.",
+                category="permission",
+                details={"permission": "destructive_command", "command": compact},
+            )
+        network_match = NETWORK_RE.search(cmd) or (os.name == "nt" and POWERSHELL_NETWORK_RE.search(cmd))
+        if not self.allow_network and network_match and not is_literal_network_reference_command(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Network access is denied by default.",
@@ -4187,7 +4338,13 @@ def landlock_device_access(handled: int) -> int:
     )
 
 
-def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots: list[Path] | None = None) -> int:
+def open_landlock_ruleset(
+    workspace: Path,
+    read_roots: list[str],
+    *,
+    write_roots: list[Path] | None = None,
+    additional_workspaces: list[Path] | None = None,
+) -> int:
     version = landlock_abi_version()
     handled = landlock_handled_access(version)
     ruleset_attr = LandlockRulesetAttr(handled)
@@ -4212,6 +4369,8 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
         )
         device_access = landlock_device_access(handled)
         add_landlock_path(ruleset_fd, workspace, workspace_access)
+        for additional_workspace in additional_workspaces or []:
+            add_landlock_path(ruleset_fd, additional_workspace, workspace_access)
         for write_root in write_roots or []:
             add_landlock_path(ruleset_fd, write_root, workspace_access, required=False)
         for read_root in read_roots:
@@ -4916,6 +5075,15 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     return payload
 
 
+def is_stateless_http_client(client_info: dict[str, Any] | None, user_agent: str | None) -> bool:
+    name = str((client_info or {}).get("name", "")).strip().lower()
+    if name in STATELESS_HTTP_CLIENT_NAMES:
+        return True
+    ua = (user_agent or "").strip().lower()
+    ua_name = ua.split(None, 1)[0].split("/", 1)[0] if ua else ""
+    return ua_name in STATELESS_HTTP_CLIENT_NAMES
+
+
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"CodingToolsMCP/{__version__}"
 
@@ -5098,20 +5266,73 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         method = request.get("method")
         session_id = self.headers.get("Mcp-Session-Id")
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        client_info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
+        user_agent = self.headers.get("User-Agent", "")
+        stateless_client = is_stateless_http_client(client_info, user_agent)
         created_session = False
+        stateless_runtime = False
+        leased_session_id: str | None = None
         if method == "initialize":
             if session_id:
                 self.send_rpc_error(
                     -32600, "initialize must not include Mcp-Session-Id", request_id=request.get("id")
                 )
                 return
-            try:
-                self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
-            except RuntimeError as exc:
-                self.send_rpc_error(-32000, str(exc), status=503, request_id=request.get("id"))
-                return
-            self._send_session_header = True
-            created_session = True
+            if stateless_client:
+                self._runtime = self.server.control_runtime.spawn_http_session_runtime()  # type: ignore[attr-defined]
+                self._runtime._stateless_http = True  # type: ignore[attr-defined]
+                self._send_session_header = False
+                stateless_runtime = True
+                snapshot = self.server.sessions.snapshot()  # type: ignore[attr-defined]
+                print(
+                    json.dumps(
+                        {
+                            "event": "mcp_http_stateless_initialize",
+                            "request_view_id": self.runtime.http_session_id,
+                            "client_name": str(client_info.get("name", ""))[:120],
+                            "client_version": str(client_info.get("version", ""))[:120],
+                            "user_agent": str(user_agent)[:240],
+                            "remote": str(self.client_address[0]) if self.client_address else "",
+                            **snapshot,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
+                except RuntimeError as exc:
+                    message = str(exc)
+                    capacity = "maximum HTTP session count reached" in message
+                    self.send_rpc_error(
+                        -32000,
+                        message,
+                        status=429 if capacity else 503,
+                        request_id=request.get("id"),
+                        extra_headers={"Retry-After": "1"} if capacity else None,
+                    )
+                    return
+                self._send_session_header = True
+                created_session = True
+                leased_session_id = self.runtime.http_session_id
+                snapshot = self.server.sessions.snapshot()  # type: ignore[attr-defined]
+                print(
+                    json.dumps(
+                        {
+                            "event": "mcp_http_session_created",
+                            "session_id": self.runtime.http_session_id,
+                            "client_name": str(client_info.get("name", ""))[:120],
+                            "client_version": str(client_info.get("version", ""))[:120],
+                            "user_agent": str(user_agent)[:240],
+                            "remote": str(self.client_address[0]) if self.client_address else "",
+                            **snapshot,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
         elif session_id:
             runtime = self.server.sessions.get(session_id)  # type: ignore[attr-defined]
             if runtime is None:
@@ -5121,7 +5342,10 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._runtime = runtime
             self._send_session_header = True
+            leased_session_id = session_id
             if protocol_version != runtime.protocol_version:
+                self.server.sessions.release(session_id)  # type: ignore[attr-defined]
+                leased_session_id = None
                 self.send_rpc_error(
                     -32600,
                     "MCP-Protocol-Version does not match the initialized session",
@@ -5131,10 +5355,23 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 return
         elif method == "ping":
             self._runtime = self.server.control_runtime  # type: ignore[attr-defined]
+        elif stateless_client:
+            self._runtime = self.server.control_runtime.spawn_http_session_runtime()  # type: ignore[attr-defined]
+            self._runtime._stateless_http = True  # type: ignore[attr-defined]
+            self._runtime.initialized = True
+            self._runtime.protocol_version = protocol_version or PROTOCOL_VERSION
+            self._send_session_header = False
+            stateless_runtime = True
         else:
             self.send_rpc_error(-32002, "Server not initialized", request_id=request.get("id"))
             return
-        response = self.handle_rpc(request)
+        try:
+            response = self.handle_rpc(request)
+        finally:
+            if leased_session_id is not None:
+                self.server.sessions.release(leased_session_id)  # type: ignore[attr-defined]
+            if stateless_runtime:
+                self.runtime.close()
         if created_session and response is not None and "error" in response:
             self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
             self._send_session_header = False
@@ -5143,9 +5380,18 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if getattr(self, "_send_session_header", False):
                 self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
             self.send_cors_headers()
-            self.end_headers()
+            try:
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+                if created_session:
+                    self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
+                    self._send_session_header = False
+                return
             return
-        self.send_json(response)
+        if not self.send_json(response) and created_session:
+            self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
+            self._send_session_header = False
 
     def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
         try:
@@ -5526,7 +5772,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         status: int = 200,
         extra_headers: dict[str, str] | None = None,
         head_only: bool = False,
-    ) -> None:
+    ) -> bool:
         body = json_response_payload(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -5537,9 +5783,30 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_cors_headers()
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
-        self.end_headers()
-        if not head_only:
-            self.wfile.write(body)
+        try:
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+            print(
+                json.dumps(
+                    {
+                        "event": "http_client_disconnected",
+                        "method": str(getattr(self, "command", "")),
+                        "path": str(getattr(self, "path", "")).split("?", 1)[0],
+                        "remote": (
+                            str(getattr(self, "client_address", ("",))[0])
+                            if getattr(self, "client_address", None)
+                            else ""
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return False
+        return True
 
 
 class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
@@ -5570,11 +5837,19 @@ def build_runtime(
     oauth_config: OAuthConfig | None = None,
     emit_warning: bool = True,
     project_context: ProjectContext | None = None,
+    command_state: SharedCommandState | None = None,
     transport: str = "stdio",
 ) -> Runtime:
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
+    configured_roots = getattr(args, "workspace_roots", None)
+    if configured_roots:
+        workspace_roots = [Path(str(item)) for item in configured_roots if str(item).strip()]
+    else:
+        raw_roots = (os.environ.get(f"{ENV_PREFIX}_WORKSPACE_ROOTS") or "").strip()
+        workspace_roots = [Path(item.strip()) for item in raw_roots.split(os.pathsep) if item.strip()]
     runtime = Runtime(
         workspace,
+        workspace_roots=workspace_roots,
         enable_view_image=args.enable_view_image,
         permission_mode=runtime_policy.permission_mode,
         shell_env_policy=runtime_policy.shell_env_policy,
@@ -5582,6 +5857,7 @@ def build_runtime(
         auth_token=auth_token,
         oauth_config=oauth_config,
         project_context=project_context,
+        command_state=command_state,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
         transport=transport,
     )
@@ -5713,15 +5989,7 @@ def run_http(args: argparse.Namespace) -> int:
     runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
 
     def runtime_factory() -> Runtime:
-        return build_runtime(
-            args,
-            runtime_policy,
-            auth_token=auth_token,
-            oauth_config=oauth_config,
-            emit_warning=False,
-            project_context=runtime.project_context,
-            transport="http",
-        )
+        return runtime.spawn_http_session_runtime()
 
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)
     if oauth_config:
@@ -5756,6 +6024,16 @@ def run_stdio(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve workspace-confined coding tools over MCP.")
     parser.add_argument("--workspace", help="workspace root; defaults to CODING_TOOLS_MCP_WORKSPACE or cwd")
+    parser.add_argument(
+        "--workspace-root",
+        dest="workspace_roots",
+        action="append",
+        default=None,
+        help=(
+            "additional allowed workspace root; may be repeated; defaults to the path-separated "
+            f"{ENV_PREFIX}_WORKSPACE_ROOTS value when no --workspace-root arguments are supplied"
+        ),
+    )
     parser.add_argument(
         "--host",
         default=os.environ.get(f"{ENV_PREFIX}_HOST") or "127.0.0.1",

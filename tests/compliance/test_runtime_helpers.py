@@ -84,6 +84,149 @@ def fake_landlock_exec() -> Iterator[dict[str, object]]:
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_multiple_workspace_roots_allow_absolute_paths_only_inside_configured_roots(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            primary = base / "primary"
+            secondary = base / "secondary"
+            outside = base / "outside"
+            primary.mkdir()
+            secondary.mkdir()
+            outside.mkdir()
+            secondary_file = secondary / "secondary.txt"
+            secondary_file.write_text("from secondary\n", encoding="utf-8")
+            outside_file = outside / "outside.txt"
+            outside_file.write_text("outside\n", encoding="utf-8")
+
+            runtime = Runtime(primary, workspace_roots=[secondary])
+            result = runtime.read_file({"path": str(secondary_file)})
+            self.assertEqual(result["content"].strip(), "from secondary")
+            self.assertEqual(result["path"], secondary_file.resolve().as_posix())
+
+            runtime.set_default_cwd({"path": str(secondary)})
+            relative = runtime.read_file({"path": "secondary.txt"})
+            self.assertEqual(relative["content"].strip(), "from secondary")
+
+            with self.assertRaises(ToolFailure) as raised:
+                runtime.workspace.resolve_existing(str(outside_file))
+            self.assertEqual(raised.exception.code, "PATH_OUTSIDE_WORKSPACE")
+
+    def test_single_workspace_keeps_absolute_path_denial(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "target.txt"
+            target.write_text("data\n", encoding="utf-8")
+            runtime = Runtime(workspace)
+
+            with self.assertRaises(ToolFailure) as raised:
+                runtime.workspace.resolve_existing(str(target))
+            self.assertEqual(raised.exception.code, "ABSOLUTE_PATH_DENIED")
+
+    def test_apply_patch_can_write_an_absolute_path_in_secondary_workspace_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            primary = base / "primary"
+            secondary = base / "secondary"
+            primary.mkdir()
+            secondary.mkdir()
+            target = secondary / "created.txt"
+            runtime = Runtime(primary, workspace_roots=[secondary])
+
+            result = runtime.apply_patch(
+                {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Add File: {target.as_posix()}\n"
+                        "+created in secondary\n"
+                        "*** End Patch"
+                    )
+                }
+            )
+            self.assertTrue(result["clean"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "created in secondary\n")
+
+    def test_parser_repeated_workspace_root_builds_multi_root_runtime(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            primary = base / "primary"
+            secondary = base / "secondary"
+            primary.mkdir()
+            secondary.mkdir()
+            parser = server_module.build_parser()
+            args = parser.parse_args(
+                ["--workspace", str(primary), "--workspace-root", str(secondary)]
+            )
+            policy = server_module.runtime_policy_from_args(args)
+            runtime = server_module.build_runtime(args, policy, emit_warning=False)
+            try:
+                self.assertEqual(runtime.workspace.root, primary.resolve())
+                self.assertEqual(runtime.workspace.roots, (primary.resolve(), secondary.resolve()))
+                self.assertEqual(
+                    runtime.server_info_payload()["workspace_roots"],
+                    [str(primary.resolve()), str(secondary.resolve())],
+                )
+            finally:
+                runtime.close()
+
+    def test_send_json_classifies_client_disconnect_without_raising(self) -> None:
+        class FakeWFile:
+            def write(self, _body: bytes) -> None:
+                raise ConnectionAbortedError(10053, "connection aborted by peer")
+
+        class FakeHandler:
+            _send_session_header = False
+            close_connection = False
+            wfile = FakeWFile()
+
+            def send_response(self, _status: int) -> None:
+                pass
+
+            def send_header(self, _name: str, _value: str) -> None:
+                pass
+
+            def send_cors_headers(self) -> None:
+                pass
+
+            def end_headers(self) -> None:
+                pass
+
+        handler = FakeHandler()
+        sent = server_module.MCPHandler.send_json(handler, {"ok": True})  # type: ignore[arg-type]
+        self.assertFalse(sent)
+        self.assertTrue(handler.close_connection)
+
+    def test_send_json_reports_successful_delivery(self) -> None:
+        class FakeWFile:
+            def __init__(self) -> None:
+                self.body = b""
+
+            def write(self, body: bytes) -> None:
+                self.body += body
+
+        class FakeHandler:
+            _send_session_header = False
+            close_connection = False
+
+            def __init__(self) -> None:
+                self.wfile = FakeWFile()
+
+            def send_response(self, _status: int) -> None:
+                pass
+
+            def send_header(self, _name: str, _value: str) -> None:
+                pass
+
+            def send_cors_headers(self) -> None:
+                pass
+
+            def end_headers(self) -> None:
+                pass
+
+        handler = FakeHandler()
+        sent = server_module.MCPHandler.send_json(handler, {"ok": True})  # type: ignore[arg-type]
+        self.assertTrue(sent)
+        self.assertIn(b'"ok":true', handler.wfile.body)
+
     def test_windows_tty_request_reports_explicit_unsupported_error(self) -> None:
         with TemporaryDirectory() as tmp, patch.object(processes_module.os, "name", "nt"):
             with self.assertRaises(ToolFailure) as raised:

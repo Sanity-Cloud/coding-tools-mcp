@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import signal
+import shutil
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, BinaryIO
 
 from .errors import ToolFailure
@@ -14,6 +16,91 @@ from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
 
 SESSION_BUFFER_BYTES = 524_288
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+_PWSH_VERSION_CACHE: dict[str, int] = {}
+
+
+def _resolve_windows_pwsh(*, cwd: str, env: dict[str, str]) -> str:
+    configured = (os.environ.get("CODING_TOOLS_MCP_PWSH_PATH") or "").strip()
+    if configured:
+        candidate = Path(configured)
+        if not candidate.is_absolute():
+            raise ToolFailure(
+                "SHELL_NOT_FOUND",
+                "CODING_TOOLS_MCP_PWSH_PATH must be an absolute path to pwsh.exe.",
+                category="runtime",
+            )
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_file():
+            raise ToolFailure(
+                "SHELL_NOT_FOUND",
+                "Configured PowerShell 7 executable does not exist.",
+                category="runtime",
+                details={"path": str(resolved)},
+            )
+    else:
+        found = shutil.which("pwsh.exe", path=env.get("PATH")) or shutil.which("pwsh", path=env.get("PATH"))
+        if not found:
+            raise ToolFailure(
+                "SHELL_NOT_FOUND",
+                "PowerShell 7 (pwsh.exe) is required for Windows string commands; cmd.exe fallback is disabled.",
+                category="runtime",
+                details={"retry_hint": "Install PowerShell 7 or set CODING_TOOLS_MCP_PWSH_PATH to pwsh.exe."},
+            )
+        resolved = Path(found).resolve(strict=False)
+
+    try:
+        workspace = Path(cwd).resolve(strict=False)
+        resolved.relative_to(workspace)
+    except ValueError:
+        pass
+    else:
+        raise ToolFailure(
+            "SHELL_NOT_FOUND",
+            "Implicit PowerShell resolution inside the command workspace is denied.",
+            category="security",
+            details={"path": str(resolved)},
+        )
+
+    key = os.path.normcase(str(resolved))
+    major = _PWSH_VERSION_CACHE.get(key)
+    if major is None:
+        try:
+            checked = subprocess.run(
+                [
+                    str(resolved),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PSVersionTable.PSVersion.Major",
+                ],
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ToolFailure(
+                "SHELL_NOT_FOUND",
+                "PowerShell 7 executable could not be verified.",
+                category="runtime",
+                details={"path": str(resolved)},
+            ) from exc
+        try:
+            major = int(checked.stdout.strip().splitlines()[-1]) if checked.returncode == 0 else 0
+        except (ValueError, IndexError):
+            major = 0
+        if major < 7:
+            raise ToolFailure(
+                "SHELL_VERSION_UNSUPPORTED",
+                "Windows string commands require PowerShell 7 or newer.",
+                category="runtime",
+                details={"path": str(resolved), "detected_major": major},
+            )
+        _PWSH_VERSION_CACHE[key] = major
+    return str(resolved)
 
 
 def terminate_process_group(
@@ -66,6 +153,11 @@ def spawn_process(
     popen_kwargs: dict[str, Any],
 ) -> tuple[subprocess.Popen[bytes], int | None]:
     """Spawn a pipe-backed or true POSIX PTY-backed process."""
+
+    if os.name == "nt" and shell and isinstance(command, str):
+        pwsh = _resolve_windows_pwsh(cwd=cwd, env=env)
+        command = [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+        shell = False
 
     if not tty:
         process = subprocess.Popen(
