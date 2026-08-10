@@ -17,7 +17,15 @@ from coding_tools_mcp.server import Runtime, input_schemas, landlock_exec_argv
 def test_exec_schema_exposes_structured_forms_without_requiring_legacy_cmd() -> None:
     schema = input_schemas()["exec_command"]
     assert "cmd" not in schema.get("required", [])
-    assert {"cmd", "argv", "powershell_script", "script_args"} <= set(schema["properties"])
+    assert {
+        "cmd",
+        "argv",
+        "powershell_script",
+        "script_args",
+        "expected_exit_codes",
+        "expected_timeout",
+        "diagnostic_mode",
+    } <= set(schema["properties"])
     assert schema["oneOf"] == [
         {"required": ["cmd"]},
         {"required": ["argv"]},
@@ -35,6 +43,56 @@ def test_exec_requires_exactly_one_execution_form() -> None:
                 runtime.exec_command({"cmd": "echo ok", "argv": ["echo", "ok"]})
             with pytest.raises(ToolFailure, match="script_args is only valid"):
                 runtime.exec_command({"argv": ["echo", "ok"], "script_args": ["x"]})
+        finally:
+            runtime.close()
+
+
+def test_direct_argv_missing_executable_is_a_structured_runtime_error() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime = Runtime(Path(tmp), permission_mode="trusted")
+        try:
+            with pytest.raises(ToolFailure) as raised:
+                runtime.exec_command({"argv": ["coding-tools-definitely-missing-executable-42"]})
+            assert raised.value.code == "EXECUTABLE_NOT_FOUND"
+            assert "PowerShell cmdlets/functions" in str(raised.value.details.get("retry_hint", ""))
+        finally:
+            runtime.close()
+
+
+def test_expected_nonzero_exit_is_marked_without_hiding_exit_code() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime = Runtime(Path(tmp), permission_mode="trusted")
+        try:
+            result = runtime.exec_command(
+                {
+                    "argv": [sys.executable, "-c", "raise SystemExit(7)"],
+                    "expected_exit_codes": [7],
+                    "timeout_ms": 5000,
+                    "yield_time_ms": 5000,
+                }
+            )
+            assert result["exit_code"] == 7
+            assert result["outcome_expected"] is True
+            assert result["expectation_reason"] == "expected_exit_code"
+        finally:
+            runtime.close()
+
+
+def test_expected_timeout_is_marked_without_hiding_timeout_state() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime = Runtime(Path(tmp), permission_mode="trusted")
+        try:
+            result = runtime.exec_command(
+                {
+                    "argv": [sys.executable, "-c", "import time; time.sleep(1)"],
+                    "expected_timeout": True,
+                    "timeout_ms": 50,
+                    "yield_time_ms": 100,
+                }
+            )
+            assert result["timed_out"] is True
+            assert result["outcome_expected"] is True
+            assert result["expectation_reason"] == "expected_timeout"
         finally:
             runtime.close()
 
@@ -192,8 +250,6 @@ def test_powershell_script_receives_recovered_windows_user_profile_context() -> 
             assert payload["AppData"]
             assert payload["LocalAppData"]
             assert payload["PSHome"] == payload["UserProfile"]
-            # Keep CLI configuration isolated even while restoring the native
-            # Windows profile identity expected by PowerShell/Electron.
-            assert payload["EnvHome"] == str(runtime.command_home_dir())
+            assert payload["EnvHome"] == payload["UserProfile"]
         finally:
             runtime.close()

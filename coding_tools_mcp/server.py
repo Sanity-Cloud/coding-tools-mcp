@@ -29,7 +29,7 @@ import urllib.parse
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 
 from . import __version__
@@ -193,6 +193,8 @@ WINDOWS_CORE_ENV_NAMES = {
     "SYSTEMDRIVE",
     *WINDOWS_USER_CONTEXT_ENV_NAMES,
 }
+WINDOWS_HOME_MODE_ENV = f"{ENV_PREFIX}_WINDOWS_HOME_MODE"
+WINDOWS_HOME_MODES = {"host", "isolated"}
 NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
@@ -514,8 +516,21 @@ def windows_host_user_environment() -> dict[str, str]:
             recovered.setdefault("HOMEDRIVE", drive)
         if tail:
             recovered.setdefault("HOMEPATH", tail)
-        recovered.setdefault("USERNAME", Path(profile).name)
+        recovered.setdefault("USERNAME", PureWindowsPath(profile).name)
     return recovered
+
+
+def windows_command_home_mode() -> str:
+    """Return the Windows command HOME policy.
+
+    Windows command-line tools frequently mix USERPROFILE and POSIX-style HOME
+    lookups.  Defaulting HOME to the authenticated user's profile keeps those
+    two views coherent.  Operators that require the historical private HOME can
+    opt back into it explicitly with CODING_TOOLS_MCP_WINDOWS_HOME_MODE=isolated.
+    """
+
+    raw = (os.environ.get(WINDOWS_HOME_MODE_ENV) or "host").strip().lower()
+    return raw if raw in WINDOWS_HOME_MODES else "host"
 
 
 def _looks_like_coding_tools_runtime_tmp(path: Path) -> bool:
@@ -1592,6 +1607,17 @@ class Runtime:
         )
 
     def command_home_dir(self) -> Path:
+        if os.name == "nt" and windows_command_home_mode() == "host":
+            profile = windows_host_user_environment().get("USERPROFILE")
+            if profile:
+                # Reuse the runtime path class so tests that emulate Windows on
+                # a POSIX host do not accidentally instantiate WindowsPath.
+                return self.home_dir.__class__(profile)
+        return self.home_dir
+
+    def runtime_home_dir(self) -> Path:
+        """Private CodingTools runtime HOME used when command-home isolation is requested."""
+
         return self.home_dir
 
     def command_tmp_dir(self) -> Path:
@@ -1676,8 +1702,12 @@ class Runtime:
             "network_allowed": self.allow_network,
             "runtime_dir": str(self.runtime_dir),
             "home": str(self.command_home_dir()),
+            "runtime_home": str(self.runtime_home_dir()),
+            "windows_home_mode": windows_command_home_mode() if os.name == "nt" else None,
             "tmpdir": str(self.command_tmp_dir()),
             "cache_dir": str(self.cache_dir),
+            "tty_supported": os.name != "nt",
+            "tty_backend": "posix-pty" if os.name != "nt" else "none",
         }
 
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
@@ -2829,6 +2859,15 @@ class Runtime:
         yield_ms = int(args.get("yield_time_ms", 10000))
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
+        expected_exit_codes = self._validate_expected_exit_codes(args.get("expected_exit_codes", []))
+        expected_timeout = bool(args.get("expected_timeout", False))
+        diagnostic_mode = str(args.get("diagnostic_mode", "normal")).strip().lower()
+        if diagnostic_mode not in {"normal", "probe"}:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "diagnostic_mode must be one of: normal, probe.",
+                category="validation",
+            )
         stdin_text = str(args.get("stdin", ""))
         env = self._command_env(args.get("env", {}))
         execution_mode: str
@@ -2939,20 +2978,55 @@ class Runtime:
         registered = False
         slot_released = False
         try:
-            process, pty_master_fd = spawn_process(
-                popen_cmd,
-                cwd=str(workdir.path),
-                shell=popen_shell,
-                env=env,
-                tty=tty,
-                popen_kwargs=popen_extra,
-            )
+            try:
+                process, pty_master_fd = spawn_process(
+                    popen_cmd,
+                    cwd=str(workdir.path),
+                    shell=popen_shell,
+                    env=env,
+                    tty=tty,
+                    popen_kwargs=popen_extra,
+                )
+            except FileNotFoundError as exc:
+                target = (
+                    str(popen_cmd[0])
+                    if isinstance(popen_cmd, (list, tuple)) and popen_cmd
+                    else str(cmd_value or "command")
+                )
+                retry_hint = (
+                    "argv[0] must name an executable; PowerShell cmdlets/functions must use powershell_script or cmd."
+                    if execution_mode == "argv"
+                    else "Verify that the executable exists and is reachable through the command environment."
+                )
+                raise ToolFailure(
+                    "EXECUTABLE_NOT_FOUND",
+                    "Command executable could not be found.",
+                    category="runtime",
+                    details={"executable": target, "retry_hint": retry_hint},
+                ) from exc
+            except PermissionError as exc:
+                raise ToolFailure(
+                    "EXECUTABLE_ACCESS_DENIED",
+                    "Command executable could not be started because access was denied.",
+                    category="runtime",
+                    details={"errno": getattr(exc, "errno", None), "winerror": getattr(exc, "winerror", None)},
+                ) from exc
+            except OSError as exc:
+                raise ToolFailure(
+                    "EXEC_START_FAILED",
+                    "Command process could not be started.",
+                    category="runtime",
+                    details={"errno": getattr(exc, "errno", None), "winerror": getattr(exc, "winerror", None)},
+                ) from exc
             session = self._make_session(
                 process,
                 timeout_at=deadline,
                 warnings=[landlock_warning] if landlock_warning else None,
                 pty_master_fd=pty_master_fd,
                 cleanup_paths=cleanup_paths,
+                expected_exit_codes=expected_exit_codes,
+                expected_timeout=expected_timeout,
+                diagnostic_mode=diagnostic_mode,
             )
             with self.sessions_lock:
                 self.starting_sessions -= 1
@@ -3000,6 +3074,7 @@ class Runtime:
             payload = session.snapshot_since_cursor(max_output_bytes)
             payload["elapsed_ms"] = int((time.time() - start) * 1000)
             payload["execution_mode"] = execution_mode
+            self._annotate_expected_exec_outcome(session, payload)
             self._add_exec_diagnostics(payload)
             return self._format_session_output(session, payload, args)
 
@@ -3042,6 +3117,27 @@ class Runtime:
         if value and not value[0]:
             raise ToolFailure("INVALID_ARGUMENT", f"{field}[0] must be non-empty.", category="validation")
         return list(value)
+
+    def _validate_expected_exit_codes(self, value: Any) -> frozenset[int]:
+        if not isinstance(value, list):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "expected_exit_codes must be an array of integers.",
+                category="validation",
+            )
+        if len(value) > 32:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "expected_exit_codes cannot contain more than 32 items.",
+                category="validation",
+            )
+        if any(not isinstance(item, int) or isinstance(item, bool) for item in value):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "expected_exit_codes must contain only integers.",
+                category="validation",
+            )
+        return frozenset(int(item) for item in value)
 
     def _cleanup_exec_paths(self, paths: list[Path]) -> None:
         for path in paths:
@@ -3367,6 +3463,9 @@ class Runtime:
         warnings: list[str] | None = None,
         pty_master_fd: int | None = None,
         cleanup_paths: list[Path] | None = None,
+        expected_exit_codes: frozenset[int] | None = None,
+        expected_timeout: bool = False,
+        diagnostic_mode: str = "normal",
     ) -> ExecSession:
         return ExecSession(
             session_id=secrets.token_urlsafe(18),
@@ -3375,6 +3474,9 @@ class Runtime:
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
             cleanup_paths=list(cleanup_paths or []),
+            expected_exit_codes=expected_exit_codes or frozenset(),
+            expected_timeout=expected_timeout,
+            diagnostic_mode=diagnostic_mode,
         )
 
     def _remember_output_session(self, session: ExecSession) -> None:
@@ -3431,6 +3533,32 @@ class Runtime:
         if session is None:
             raise ToolFailure("SESSION_NOT_FOUND", "Output session not found.", category="runtime")
         return session
+
+    def _annotate_expected_exec_outcome(self, session: ExecSession, payload: dict[str, Any]) -> None:
+        """Mark explicitly expected probe outcomes so diagnostics do not create false incidents."""
+
+        status = str(payload.get("status") or "").lower()
+        if status == "running":
+            return
+        timed_out = bool(payload.get("timed_out")) or status == "timeout"
+        exit_code = payload.get("exit_code")
+        nonzero = isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+        terminated = status == "terminated"
+        reason: str | None = None
+        if session.diagnostic_mode == "probe" and (timed_out or nonzero or terminated):
+            reason = "diagnostic_probe"
+        elif timed_out and session.expected_timeout:
+            reason = "expected_timeout"
+        elif (
+            isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+            and exit_code != 0
+            and exit_code in session.expected_exit_codes
+        ):
+            reason = "expected_exit_code"
+        if reason is not None:
+            payload["outcome_expected"] = True
+            payload["expectation_reason"] = reason
 
     def _format_session_output(self, session: ExecSession, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         terminal = payload.get("status") != "running"
@@ -3616,6 +3744,7 @@ class Runtime:
             if chars:
                 raise ToolFailure("SESSION_CLOSED", "Session is closed; stdin write blocked.", category="runtime")
             payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+            self._annotate_expected_exec_outcome(session, payload)
             return self._format_session_output(session, payload, args)
         if chars:
             session.write_input(chars.encode("utf-8"))
@@ -3633,6 +3762,7 @@ class Runtime:
                     if time.time() - first_output_at >= 0.05:
                         break
         payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+        self._annotate_expected_exec_outcome(session, payload)
         return self._format_session_output(session, payload, args)
 
     def _wait_for_session_exit(self, session: ExecSession, wait_seconds: float) -> bool:
@@ -3850,16 +3980,34 @@ class Runtime:
         git_env = self._git_env()
         requested_path = str(args.get("path", "."))
         resolved = self.resolve_existing(requested_path)
-        if not self._is_git_repo(resolved.path, env=git_env):
+        probe_dir = resolved.path if resolved.path.is_dir() else resolved.path.parent
+        root_check = self._run_git_text(
+            [git, "-C", str(probe_dir), "rev-parse", "--show-toplevel"],
+            timeout=10,
+            env=git_env,
+        )
+        if root_check.returncode != 0:
             return {"is_repo": False, "commits": [], "truncated": False, "warnings": []}
+        repo_root = Path(root_check.stdout.strip()).resolve(strict=False)
         ref = validate_git_ref(str(args.get("ref", "HEAD")))
         max_count = int(args.get("max_count", 20))
         skip = int(args.get("skip", 0))
-        path_filter = resolved.display
+        path_filter: str | None = None
+        resolved_path = resolved.path.resolve(strict=False)
+        if resolved_path != repo_root:
+            try:
+                path_filter = resolved_path.relative_to(repo_root).as_posix()
+            except ValueError:
+                raise ToolFailure(
+                    "PATH_OUTSIDE_REPOSITORY",
+                    "Requested git_log path is not contained by the resolved repository.",
+                    category="validation",
+                    details={"path": resolved.display, "repository": str(repo_root)},
+                )
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(repo_root),
             "log",
             f"--max-count={max_count + 1}",
             f"--skip={skip}",
@@ -3867,7 +4015,7 @@ class Runtime:
             "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s%x1e",
             ref,
         ]
-        if path_filter != ".":
+        if path_filter:
             cmd.extend(["--", path_filter])
         completed = self._run_git_text(cmd, timeout=10, env=git_env)
         if completed.returncode != 0:
@@ -3891,7 +4039,8 @@ class Runtime:
         result = {
             "is_repo": True,
             "ref": ref,
-            "path": path_filter,
+            "path": path_filter or ".",
+            "repository": str(repo_root),
             "max_count": max_count,
             "skip": skip,
             "commits": commits[:max_count],
@@ -5364,6 +5513,24 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "cwd": {**string},
                 "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
                 "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
+                "expected_exit_codes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "maxItems": 32,
+                    "default": [],
+                    "description": "Non-zero exit codes that are expected for this command and should not create a diagnostic incident.",
+                },
+                "expected_timeout": {
+                    **boolean,
+                    "default": False,
+                    "description": "Treat a command timeout as an expected outcome rather than a diagnostic incident.",
+                },
+                "diagnostic_mode": {
+                    **string,
+                    "enum": ["normal", "probe"],
+                    "default": "normal",
+                    "description": "Use probe for intentional failure/timeout diagnostics so expected outcomes do not enter the incident ledger.",
+                },
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -24,6 +25,20 @@ class DiagnosticRecorderTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         assert failure is not None
         self.assertEqual(failure["code"], "EXEC_NONZERO_EXIT")
+
+    def test_expected_exec_outcome_is_not_classified_as_failure(self) -> None:
+        failure = classify_failure(
+            "exec_command",
+            {
+                "ok": True,
+                "status": "exited",
+                "exit_code": 7,
+                "timed_out": False,
+                "outcome_expected": True,
+                "expectation_reason": "expected_exit_code",
+            },
+        )
+        self.assertIsNone(failure)
 
     def test_durable_report_and_ledger_omit_command_content_and_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,6 +180,39 @@ class DiagnosticRecorderTests(unittest.TestCase):
                 self.assertFalse(payload["ok"])
                 self.assertTrue(payload["diagnostic_receipt"]["recorded"])
                 self.assertTrue(Path(payload["diagnostic_receipt"]["report_path"]).exists())
+                runtime.close()
+
+    def test_expected_nonzero_exec_does_not_create_diagnostic_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            diagnostic_root = root / "diagnostics"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "CODING_TOOLS_MCP_DIAGNOSTIC_DIR": str(diagnostic_root),
+                    "CODING_TOOLS_MCP_DIAGNOSTICS": "on",
+                },
+                clear=False,
+            ):
+                runtime = Runtime(workspace, permission_mode="trusted")
+                result = runtime.call_tool(
+                    "exec_command",
+                    {
+                        "argv": [sys.executable, "-c", "raise SystemExit(7)"],
+                        "expected_exit_codes": [7],
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    },
+                )
+                payload = result["structuredContent"]
+                self.assertEqual(payload.get("exit_code"), 7)
+                self.assertIs(payload.get("outcome_expected"), True)
+                self.assertNotIn("diagnostic_receipt", payload)
+                if diagnostic_root.exists():
+                    ledger = diagnostic_root / "errors.jsonl"
+                    self.assertFalse(ledger.exists() and ledger.read_text(encoding="utf-8").strip())
                 runtime.close()
 
     def test_invalid_request_is_logged_before_jsonrpc_error_is_reraised(self) -> None:

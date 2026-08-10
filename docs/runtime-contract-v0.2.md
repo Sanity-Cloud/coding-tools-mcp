@@ -111,7 +111,7 @@ Tool failures keep the same envelope with `isError: true`, a readable error in
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "INVALID_BASE64", "IS_DIRECTORY", "MODE_REQUIRED_FOR_EXISTING_FILE", "NOT_A_DIRECTORY", "NOT_A_FILE", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PARENT_NOT_FOUND", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SENSITIVE_FILE_REQUIRES_EXPLICIT_ALLOW", "SESSION_CLOSED", "SESSION_LIMIT_REACHED", "SESSION_NOT_FOUND", "SHA256_MISMATCH", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "STATELESS_TRANSPORT", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
+["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "EXECUTABLE_ACCESS_DENIED", "EXECUTABLE_NOT_FOUND", "EXEC_START_FAILED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "INVALID_BASE64", "IS_DIRECTORY", "MODE_REQUIRED_FOR_EXISTING_FILE", "NOT_A_DIRECTORY", "NOT_A_FILE", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PARENT_NOT_FOUND", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_REPOSITORY", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SENSITIVE_FILE_REQUIRES_EXPLICIT_ALLOW", "SESSION_CLOSED", "SESSION_LIMIT_REACHED", "SESSION_NOT_FOUND", "SHA256_MISMATCH", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "STATELESS_TRANSPORT", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
@@ -283,7 +283,7 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 
 ### exec_command
 
-Inputs: `"cmd"`, `"argv"`, `"powershell_script"`, `"script_args"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
+Inputs: `"cmd"`, `"argv"`, `"powershell_script"`, `"script_args"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"expected_exit_codes"`, `"expected_timeout"`, `"diagnostic_mode"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
 
 Annotations: `{"title":"Execute command","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}`.
 
@@ -301,6 +301,17 @@ binding semantics. Completed sessions remove their staged
 PowerShell source. Windows PowerShell 5.1 is not an execution fallback. Success
 payloads report the selected `execution_mode` as `shell`, `argv`, or
 `powershell_script`.
+
+Direct `argv` startup failures are normalized as `EXECUTABLE_NOT_FOUND`,
+`EXECUTABLE_ACCESS_DENIED`, or `EXEC_START_FAILED`. `argv[0]` must be an actual
+executable; PowerShell cmdlets and functions belong in `powershell_script` or
+the legacy `cmd` form.
+
+Callers can declare bounded diagnostic outcomes with `expected_exit_codes`,
+`expected_timeout`, or `diagnostic_mode: "probe"`. The real exit code, timeout
+state, and output are preserved. Matching terminal results are annotated with
+`outcome_expected: true` and `expectation_reason` and are not promoted into the
+automatic durable diagnostic incident ledger.
 
 ### write_stdin
 

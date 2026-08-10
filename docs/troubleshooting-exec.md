@@ -13,6 +13,9 @@ Common codes:
 - `INLINE_SCRIPT_PERMISSION_REQUIRED`: safe mode blocked inline interpreter or shell code.
 - `LANDLOCK_READ_ROOT_BLOCKED`: a toolchain file path is missing from read roots.
 - `SECRET_ENV_REJECTED`: secret-looking or loader/startup env was rejected.
+- `EXECUTABLE_NOT_FOUND`: direct `argv` execution could not resolve `argv[0]`; PowerShell cmdlets/functions must use `powershell_script` or `cmd` rather than being passed as executables.
+- `EXECUTABLE_ACCESS_DENIED`: the executable exists but Windows/OS process creation denied access.
+- `EXEC_START_FAILED`: process creation failed before the command could run.
 - `COMMAND_TIMED_OUT`: the command exceeded `timeout_ms`.
 - `OUTPUT_TRUNCATED`: stdout or stderr exceeded output limits.
 
@@ -25,16 +28,46 @@ from another restricted CodingTools command and those variables are missing,
 the server recovers them directly from `HKCU\Volatile Environment`; it does not
 invoke `cmd.exe` or Windows PowerShell to reconstruct them.
 
-`HOME`, `TEMP`, `TMP`, and `TMPDIR` remain pointed at CodingTools-private runtime
-directories so CLI dotfiles and temporary build material stay isolated. With a
-valid `USERPROFILE`, PowerShell 7 initializes its `$HOME` automatic variable to
-the real Windows profile while `$env:HOME` remains the private CodingTools home.
+By default on Windows, `HOME` is aligned with the authenticated `USERPROFILE`.
+This keeps POSIX-style Windows CLIs (OpenSSH, Git helpers, language tools, etc.)
+on the same user identity as native applications instead of silently hiding
+`~/.ssh`, `~/.gitconfig`, and other user-owned CLI state behind a temporary
+CodingTools home. Runtime storage itself remains private under `runtime_dir`;
+`TEMP`, `TMP`, and `TMPDIR` continue to use that private runtime directory.
+
+Operators that require the historical isolated command home can set:
+
+```text
+CODING_TOOLS_MCP_WINDOWS_HOME_MODE=isolated
+```
+
+The default is `host`. `server_info` and `check_exec_environment` report both
+the effective command `home` and the private `runtime_home`.
 
 Windows string commands are executed by PowerShell 7 (`pwsh.exe`). Windows
 PowerShell 5.1 (`powershell.exe`) is rejected rather than used as a fallback.
 When a recursively launched CodingTools server inherits a prior CodingTools
 private `TEMP`, runtime storage is re-anchored at the authenticated user's
 LocalAppData temp directory to avoid recursively nested runtime paths.
+
+Windows currently reports `tty_supported=false` / `tty_backend=none`. Callers
+should not request `tty=true` until a ConPTY backend is available; this is a
+declared capability limitation rather than a generic command failure.
+
+## Intentional probes and expected failures
+
+Diagnostic commands often use non-zero exits or timeouts on purpose. To keep
+those probes out of the durable incident ledger without hiding the raw result,
+use one of the explicit execution expectations:
+
+- `expected_exit_codes: [1, 2, ...]` for known non-zero probe results;
+- `expected_timeout: true` when a timeout is the expected observation;
+- `diagnostic_mode: "probe"` for a bounded diagnostic command where failure is
+  itself the measurement.
+
+The command still returns its real `exit_code`, timeout state, and output. An
+expected failing outcome is annotated with `outcome_expected=true` and an
+`expectation_reason`; only automatic incident creation is suppressed.
 
 Useful explicit probes:
 
