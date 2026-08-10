@@ -16,6 +16,26 @@ Common codes:
 - `COMMAND_TIMED_OUT`: the command exceeded `timeout_ms`.
 - `OUTPUT_TRUNCATED`: stdout or stderr exceeded output limits.
 
+## Windows profile and PowerShell environment
+
+On Windows, the default `core` environment includes the session identity paths
+that native applications expect: `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`,
+`USERNAME`, `APPDATA`, and `LOCALAPPDATA`. If CodingTools itself was launched
+from another restricted CodingTools command and those variables are missing,
+the server recovers them directly from `HKCU\Volatile Environment`; it does not
+invoke `cmd.exe` or Windows PowerShell to reconstruct them.
+
+`HOME`, `TEMP`, `TMP`, and `TMPDIR` remain pointed at CodingTools-private runtime
+directories so CLI dotfiles and temporary build material stay isolated. With a
+valid `USERPROFILE`, PowerShell 7 initializes its `$HOME` automatic variable to
+the real Windows profile while `$env:HOME` remains the private CodingTools home.
+
+Windows string commands are executed by PowerShell 7 (`pwsh.exe`). Windows
+PowerShell 5.1 (`powershell.exe`) is rejected rather than used as a fallback.
+When a recursively launched CodingTools server inherits a prior CodingTools
+private `TEMP`, runtime storage is re-anchored at the authenticated user's
+LocalAppData temp directory to avoid recursively nested runtime paths.
+
 Useful explicit probes:
 
 ```bash

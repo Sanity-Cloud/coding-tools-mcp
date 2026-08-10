@@ -159,3 +159,41 @@ def test_powershell_script_preserves_literal_argument_and_cleans_temp_source() -
             assert not list(script_dir.glob("*.ps1"))
         finally:
             runtime.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows profile recovery is Windows-specific")
+def test_powershell_script_receives_recovered_windows_user_profile_context() -> None:
+    if not (shutil.which("pwsh.exe") or shutil.which("pwsh")):
+        pytest.skip("PowerShell 7 is unavailable")
+    with TemporaryDirectory() as tmp:
+        runtime = Runtime(Path(tmp), permission_mode="trusted")
+        try:
+            result = runtime.exec_command(
+                {
+                    "powershell_script": (
+                        "[pscustomobject]@{"
+                        "Major=$PSVersionTable.PSVersion.Major;"
+                        "PSHome=$HOME;"
+                        "UserProfile=$env:USERPROFILE;"
+                        "AppData=$env:APPDATA;"
+                        "LocalAppData=$env:LOCALAPPDATA;"
+                        "EnvHome=$env:HOME"
+                        "} | ConvertTo-Json -Compress"
+                    ),
+                    "timeout_ms": 5000,
+                    "yield_time_ms": 5000,
+                }
+            )
+            assert result["status"] == "exited", result
+            assert result["exit_code"] == 0, result
+            payload = json.loads(result["stdout"])
+            assert payload["Major"] >= 7
+            assert payload["UserProfile"]
+            assert payload["AppData"]
+            assert payload["LocalAppData"]
+            assert payload["PSHome"] == payload["UserProfile"]
+            # Keep CLI configuration isolated even while restoring the native
+            # Windows profile identity expected by PowerShell/Electron.
+            assert payload["EnvHome"] == str(runtime.command_home_dir())
+        finally:
+            runtime.close()
