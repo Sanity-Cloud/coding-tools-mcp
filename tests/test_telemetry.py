@@ -58,9 +58,14 @@ def _initialize(runtime: Runtime, client_name: str = "test-client") -> None:
 
 
 class TelemetryModeTests(unittest.TestCase):
-    def test_default_is_on(self) -> None:
+    def test_default_is_off(self) -> None:
         with scrubbed_env():
-            self.assertEqual(telemetry.telemetry_mode(), "on")
+            self.assertEqual(telemetry.telemetry_mode(), "off")
+
+    def test_env_switch_enables(self) -> None:
+        for value in ("on", "1", "true", "yes", "enabled"):
+            with self.subTest(value=value), scrubbed_env(CODING_TOOLS_MCP_TELEMETRY=value):
+                self.assertEqual(telemetry.telemetry_mode(), "on")
 
     def test_env_switch_disables(self) -> None:
         for value in ("off", "0", "false", "no", "disabled"):
@@ -76,7 +81,7 @@ class TelemetryModeTests(unittest.TestCase):
             self.assertEqual(telemetry.telemetry_mode(), "off")
 
     def test_ci_disables(self) -> None:
-        with scrubbed_env(CI="true"):
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on", CI="true"):
             self.assertEqual(telemetry.telemetry_mode(), "off")
 
     def test_debug_mode(self) -> None:
@@ -118,7 +123,7 @@ class OffMeansOffTests(unittest.TestCase):
 
 def _run_probe_session() -> _CapturingSender:
     sender = _CapturingSender()
-    with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+    with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(telemetry, "_get_sender", lambda: sender):
         with tempfile.TemporaryDirectory() as tmp:
             marker = "leakprobe-a8f3"
             workspace = Path(tmp) / marker
@@ -184,7 +189,7 @@ class SessionEventTests(unittest.TestCase):
 
     def test_sessions_without_initialize_emit_nothing(self) -> None:
         sender = _CapturingSender()
-        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(telemetry, "_get_sender", lambda: sender):
             with tempfile.TemporaryDirectory() as tmp:
                 runtime = Runtime(Path(tmp))
                 runtime.call_tool("get_default_cwd", {})
@@ -194,7 +199,7 @@ class SessionEventTests(unittest.TestCase):
 
     def test_error_events_are_capped_and_drops_are_counted(self) -> None:
         sender = _CapturingSender()
-        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(telemetry, "_get_sender", lambda: sender):
             session = SessionTelemetry(permission_mode="safe")
             session.record_session_start({"name": "cap"}, "2025-11-25")
             for _ in range(ERROR_EVENTS_PER_SESSION + 5):
@@ -211,7 +216,7 @@ class SessionEventTests(unittest.TestCase):
 
     def test_duration_buckets_and_finish_is_idempotent(self) -> None:
         sender = _CapturingSender()
-        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(telemetry, "_get_sender", lambda: sender):
             session = SessionTelemetry(permission_mode="safe")
             session.record_session_start(None, "2025-11-25")
             for duration in (50, 500, 5_000, 50_000):
@@ -238,6 +243,15 @@ class DocumentationDriftTests(unittest.TestCase):
         self.assertIn(f"max {ERROR_EVENTS_PER_SESSION} per session", doc)
 
 
+class RuntimeCloseTests(unittest.TestCase):
+    def test_close_swallows_telemetry_finish_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp))
+            runtime.telemetry.finish = Mock(side_effect=RuntimeError("telemetry boom"))  # type: ignore[method-assign]
+            runtime.close()
+            runtime.telemetry.finish.assert_called_once()
+
+
 class InstallIdTests(unittest.TestCase):
     def setUp(self) -> None:
         self._saved = telemetry._install_id
@@ -248,19 +262,28 @@ class InstallIdTests(unittest.TestCase):
 
     def test_install_id_is_random_stable_and_resettable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"HOME": tmp}):
+            home = Path(tmp)
+            with patch.object(telemetry.Path, "home", return_value=home):
                 first = telemetry.install_id()
                 self.assertEqual(telemetry.install_id(), first)
-                path = Path(tmp) / ".coding-tools-mcp" / "id"
+                path = home / ".coding-tools-mcp" / "id"
                 self.assertEqual(path.read_text(encoding="utf-8").strip(), first)
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+                if os.name != "nt":
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
 
                 telemetry._install_id = None
                 path.unlink()
                 second = telemetry.install_id()
                 self.assertNotEqual(second, first)
                 self.assertEqual(len(second), 32)
+
+    def test_install_id_falls_back_when_home_is_unavailable(self) -> None:
+        with patch.object(telemetry.Path, "home", side_effect=RuntimeError("no home")):
+            value = telemetry.install_id()
+        self.assertEqual(len(value), 32)
+        self.assertTrue(telemetry._looks_like_install_id(value))
+        self.assertEqual(telemetry.install_id(), value)
 
 
 if __name__ == "__main__":

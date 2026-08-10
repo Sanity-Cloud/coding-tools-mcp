@@ -1,13 +1,21 @@
 # Telemetry
 
-coding-tools-mcp collects anonymous usage telemetry to answer two product
+coding-tools-mcp can collect anonymous usage telemetry to answer two product
 questions: how many installs are active, and which tools succeed, fail, or run
-slowly in the wild. Telemetry is enabled by default and can be disabled at any
-time; disabling it changes nothing else about the server.
+slowly in the wild. Outbound PostHog telemetry is opt-in (default off); enabling
+or disabling it changes nothing else about the server. Local operational logging
+is unaffected.
 
-## How to disable
+## How to enable
 
-Any one of the following turns telemetry off completely:
+```bash
+export CODING_TOOLS_MCP_TELEMETRY=on   # also accepts 1 / true / yes
+```
+
+## How to keep telemetry off
+
+Telemetry is off unless explicitly enabled. Any one of the following also keeps
+sending disabled:
 
 ```bash
 export CODING_TOOLS_MCP_TELEMETRY=off   # also accepts 0 / false / no
@@ -17,7 +25,8 @@ export DO_NOT_TRACK=1                    # the cross-tool convention
 Telemetry is also disabled automatically whenever `CI` is set, and the test
 suite forces it off in `tests/__init__.py`, so CI and test runs never pollute
 usage data. Deleting `~/.coding-tools-mcp/id` resets the anonymous install
-identity.
+identity. If the home directory is unavailable, the install id falls back to an
+in-process random value and is never persisted.
 
 To see exactly what would be sent without sending it:
 

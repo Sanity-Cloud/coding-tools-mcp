@@ -11,6 +11,13 @@
   `runtime_home` separately from the effective command `home`, plus explicit
   `tty_supported` / `tty_backend` capability metadata.
 
+### Changed
+
+- Outbound PostHog telemetry is now opt-in (default off). Set
+  `CODING_TOOLS_MCP_TELEMETRY=on` (or `1` / `true` / `yes`) to enable sending.
+  `off` / `DO_NOT_TRACK` / `CI` still force sending disabled; `debug` still
+  prints events to stderr without sending.
+
 ### Fixed
 
 - Windows command `HOME` now defaults to the authenticated `USERPROFILE`,
@@ -26,6 +33,10 @@
   that path. This fixes additional-root/worktree calls that were first validated
   against the requested worktree and then incorrectly executed with `git -C`
   against the primary workspace.
+- `install_id()` no longer fails when `Path.home()` is unavailable; it falls
+  back to an in-process random id and skips persistence.
+- `Runtime.close()` treats `telemetry.finish()` failures as non-critical so
+  teardown cannot abort runtime cleanup.
 
 ## 0.2.3 - 2026-08-10
 
