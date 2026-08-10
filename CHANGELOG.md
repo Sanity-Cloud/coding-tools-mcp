@@ -15,6 +15,21 @@
   omits raw command/file content, stdin, positional command arguments, and
   environment values while redacting secret-like fields and token patterns.
 
+### Fixed
+
+- Windows `core` command environments now preserve/recover the authenticated
+  user's `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `USERNAME`, `APPDATA`, and
+  `LOCALAPPDATA` values. If an MCP host was itself launched from a restricted
+  CodingTools command and those values were stripped, the server restores them
+  from `HKCU\Volatile Environment` without invoking `cmd.exe` or Windows
+  PowerShell. This fixes Electron/native applications failing on an undefined
+  `%USERPROFILE%` and restores PowerShell 7's `$HOME` initialization while
+  keeping CodingTools' isolated `HOME` for CLI dotfiles.
+- Windows runtime storage now detects recursive CodingTools-private `TEMP`
+  inheritance and re-anchors at the current user's stable LocalAppData temp
+  directory, preventing repeated `...\coding-tools-mcp\...\tmp\coding-tools-mcp`
+  nesting when the server is restarted from inside a CodingTools command.
+
 ## 0.2.2 - 2026-07-28
 
 ### Fixed

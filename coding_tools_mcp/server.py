@@ -176,7 +176,23 @@ POSIX_CORE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "TERM"}
 # Not POSIX core, but inherited under inherit="core" so git helper subprocesses and
 # exec_command share the host's global git config (e.g. safe.directory entries).
 GIT_ENV_NAMES = {"GIT_CONFIG_GLOBAL"}
-WINDOWS_CORE_ENV_NAMES = {"PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR"}
+WINDOWS_USER_CONTEXT_ENV_NAMES = {
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "APPDATA",
+    "LOCALAPPDATA",
+}
+WINDOWS_CORE_ENV_NAMES = {
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "WINDIR",
+    "SYSTEMDRIVE",
+    *WINDOWS_USER_CONTEXT_ENV_NAMES,
+}
 NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
@@ -438,8 +454,92 @@ def configured_runtime_root() -> Path | None:
     return Path(configured).expanduser()
 
 
+@functools.lru_cache(maxsize=1)
+def _windows_registry_user_environment() -> tuple[tuple[str, str], ...]:
+    """Recover the interactive Windows user context without invoking a shell.
+
+    MCP hosts can themselves be spawned through a restricted command
+    environment. In that case ordinary Windows variables such as USERPROFILE,
+    APPDATA and LOCALAPPDATA may be absent even though the process is still
+    running in the authenticated user's session. HKCU's volatile environment is
+    the session-owned source of truth and avoids cmd.exe / Windows PowerShell
+    fallback just to reconstruct those paths.
+    """
+
+    if os.name != "nt":
+        return ()
+    try:
+        import winreg
+    except ImportError:
+        return ()
+
+    recovered: dict[str, str] = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Volatile Environment") as key:
+            for name in WINDOWS_USER_CONTEXT_ENV_NAMES:
+                try:
+                    value, _value_type = winreg.QueryValueEx(key, name)
+                except OSError:
+                    continue
+                if isinstance(value, str) and value.strip():
+                    recovered[name] = value.strip()
+    except OSError:
+        return ()
+    return tuple(sorted(recovered.items()))
+
+
+def windows_host_user_environment() -> dict[str, str]:
+    """Return a bounded, non-secret Windows user-context environment.
+
+    Existing process values win. Missing values are recovered from the current
+    user's HKCU session environment so a server recursively launched through
+    CodingTools does not lose the Windows profile identity required by Electron,
+    PowerShell and many native CLIs.
+    """
+
+    if os.name != "nt":
+        return {}
+    recovered: dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper = str(key).upper()
+        if upper in WINDOWS_USER_CONTEXT_ENV_NAMES and str(value).strip():
+            recovered[upper] = str(value)
+    for key, value in _windows_registry_user_environment():
+        recovered.setdefault(key.upper(), value)
+
+    profile = recovered.get("USERPROFILE")
+    if profile:
+        drive, tail = os.path.splitdrive(profile)
+        if drive:
+            recovered.setdefault("HOMEDRIVE", drive)
+        if tail:
+            recovered.setdefault("HOMEPATH", tail)
+        recovered.setdefault("USERNAME", Path(profile).name)
+    return recovered
+
+
+def _looks_like_coding_tools_runtime_tmp(path: Path) -> bool:
+    if path.name.casefold() != "tmp":
+        return False
+    return any(parent.name.casefold() == RUNTIME_ROOT_DIR_NAME.casefold() for parent in path.parents)
+
+
 def runtime_parent_root() -> Path:
-    return configured_runtime_root() or Path(tempfile.gettempdir()) / RUNTIME_ROOT_DIR_NAME
+    configured = configured_runtime_root()
+    if configured is not None:
+        return configured
+
+    process_tmp = Path(tempfile.gettempdir())
+    if os.name == "nt" and _looks_like_coding_tools_runtime_tmp(process_tmp):
+        # A CodingTools server started by another CodingTools command inherits
+        # that command's private TEMP. Reusing it recursively produces paths like
+        # ...\coding-tools-mcp\<id>\tmp\coding-tools-mcp\<id>\tmp\... . Anchor
+        # a replacement at the authenticated Windows user's stable local temp
+        # directory instead.
+        local_app_data = windows_host_user_environment().get("LOCALAPPDATA")
+        if local_app_data:
+            process_tmp = Path(local_app_data) / "Temp"
+    return process_tmp / RUNTIME_ROOT_DIR_NAME
 
 
 def runtime_parent_fallback_root() -> Path | None:
@@ -3240,11 +3340,22 @@ class Runtime:
     def _base_command_env(self) -> dict[str, str]:
         if self.shell_env_policy.inherit == "none":
             return {}
+        source = {str(key): str(value) for key, value in os.environ.items()}
+        if os.name == "nt":
+            # Restricted parent processes can strip USERPROFILE/AppData from the
+            # server itself. Rehydrate only the bounded Windows user-context
+            # variables needed by native applications and PowerShell. This does
+            # not broaden toolchain or secret inheritance.
+            existing = {key.upper() for key in source}
+            for key, value in windows_host_user_environment().items():
+                if key.upper() not in existing:
+                    source[key] = value
+                    existing.add(key.upper())
         if self.shell_env_policy.inherit == "all":
-            return {str(key): str(value) for key, value in os.environ.items()}
+            return source
         return {
             str(key): str(value)
-            for key, value in os.environ.items()
+            for key, value in source.items()
             if is_core_command_env_name(str(key))
         }
 

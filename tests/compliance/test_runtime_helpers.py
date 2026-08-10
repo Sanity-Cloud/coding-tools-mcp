@@ -556,6 +556,12 @@ class RuntimeHelperTests(unittest.TestCase):
                 "PATHEXT": ".COM;.EXE;.BAT;.CMD",
                 "SystemRoot": r"C:\Windows",
                 "ComSpec": r"C:\Windows\System32\cmd.exe",
+                "USERPROFILE": r"C:\Users\Example",
+                "HOMEDRIVE": "C:",
+                "HOMEPATH": r"\Users\Example",
+                "USERNAME": "Example",
+                "APPDATA": r"C:\Users\Example\AppData\Roaming",
+                "LOCALAPPDATA": r"C:\Users\Example\AppData\Local",
                 "INCLUDE": r"C:\VS\VC\Tools\MSVC\include;C:\SDK\Include",
                 "LIB": r"C:\VS\VC\Tools\MSVC\lib;C:\SDK\Lib",
                 "LIBPATH": r"C:\VS\VC\Tools\MSVC\libpath",
@@ -575,6 +581,12 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(env.get("PATHEXT"), host_env["PATHEXT"])
             self.assertEqual(env.get("SystemRoot"), host_env["SystemRoot"])
             self.assertEqual(env.get("ComSpec"), host_env["ComSpec"])
+            self.assertEqual(env.get("USERPROFILE"), host_env["USERPROFILE"])
+            self.assertEqual(env.get("HOMEDRIVE"), host_env["HOMEDRIVE"])
+            self.assertEqual(env.get("HOMEPATH"), host_env["HOMEPATH"])
+            self.assertEqual(env.get("USERNAME"), host_env["USERNAME"])
+            self.assertEqual(env.get("APPDATA"), host_env["APPDATA"])
+            self.assertEqual(env.get("LOCALAPPDATA"), host_env["LOCALAPPDATA"])
             self.assertEqual(env.get("CUSTOM"), "ok")
             self.assertEqual(env.get("HOME"), str(runtime.command_home_dir()))
             self.assertEqual(env.get("TEMP"), str(runtime.command_tmp_dir()))
@@ -592,6 +604,40 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertTrue(runtime.command_tmp_dir().is_dir())
             self.assertTrue(runtime.cache_dir.is_dir())
             self.assertFalse((workspace / ".coding-tools").exists())
+
+    def test_command_env_core_recovers_windows_user_context_when_parent_stripped_it(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp))
+            host_env = {
+                "Path": r"C:\Windows\System32",
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "SystemRoot": r"C:\Windows",
+                "ComSpec": r"C:\Windows\System32\cmd.exe",
+            }
+            recovered = (
+                ("APPDATA", r"C:\Users\Example\AppData\Roaming"),
+                ("HOMEDRIVE", "C:"),
+                ("HOMEPATH", r"\Users\Example"),
+                ("LOCALAPPDATA", r"C:\Users\Example\AppData\Local"),
+                ("USERNAME", "Example"),
+                ("USERPROFILE", r"C:\Users\Example"),
+            )
+            with (
+                patch.object(server_module.os, "name", "nt"),
+                patch.dict(server_module.os.environ, host_env, clear=True),
+                patch.object(server_module, "_windows_registry_user_environment", return_value=recovered),
+            ):
+                env = runtime._command_env({})
+
+            self.assertEqual(env.get("USERPROFILE"), r"C:\Users\Example")
+            self.assertEqual(env.get("APPDATA"), r"C:\Users\Example\AppData\Roaming")
+            self.assertEqual(env.get("LOCALAPPDATA"), r"C:\Users\Example\AppData\Local")
+            self.assertEqual(env.get("HOMEDRIVE"), "C:")
+            self.assertEqual(env.get("HOMEPATH"), r"\Users\Example")
+            self.assertEqual(env.get("USERNAME"), "Example")
+            # CLI dotfiles still use CodingTools' private HOME; Windows-native
+            # applications use USERPROFILE/AppData from the real user session.
+            self.assertEqual(env.get("HOME"), str(runtime.command_home_dir()))
 
     def test_command_env_uses_external_home_tmp_and_cache_without_ecosystem_cache_vars(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -754,6 +800,23 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(trusted.runtime_dir.parent.parent, runtime_parent_root())
             self.assertEqual(safe.command_tmp_dir().parent, safe.runtime_dir)
             self.assertEqual(trusted.command_tmp_dir().parent, trusted.runtime_dir)
+
+    @unittest.skipUnless(os.name == "nt", "Windows runtime-temp recovery is Windows-specific")
+    def test_runtime_root_denests_recursive_coding_tools_temp_on_windows(self) -> None:
+        nested_tmp = Path(
+            r"C:\Users\Example\AppData\Local\Temp\coding-tools-mcp\workspacehash\instance\tmp"
+        )
+        with (
+            patch.object(server_module.tempfile, "gettempdir", return_value=str(nested_tmp)),
+            patch.object(
+                server_module,
+                "windows_host_user_environment",
+                return_value={"LOCALAPPDATA": r"C:\Users\Example\AppData\Local"},
+            ),
+        ):
+            root = runtime_parent_root()
+
+        self.assertEqual(root, Path(r"C:\Users\Example\AppData\Local\Temp\coding-tools-mcp"))
 
     def test_command_env_include_exclude_and_set_are_applied_in_order(self) -> None:
         with TemporaryDirectory() as tmp:
