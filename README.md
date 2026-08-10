@@ -164,9 +164,10 @@ a VM for genuinely untrusted work. Details:
 
 ## Telemetry
 
-The server sends anonymous usage telemetry (per-tool success/latency counters
-and version/platform dimensions — never paths, arguments, commands, or file
-contents) to help prioritize fixes. Disable it with
+Outbound PostHog telemetry is opt-in (default off). When enabled with
+`CODING_TOOLS_MCP_TELEMETRY=on`, the server sends anonymous usage telemetry
+(per-tool success/latency counters and version/platform dimensions — never
+paths, arguments, commands, or file contents). Keep it off with
 `CODING_TOOLS_MCP_TELEMETRY=off` or `DO_NOT_TRACK=1`; it is automatically off
 in CI. `CODING_TOOLS_MCP_TELEMETRY=debug` prints every event to stderr instead
 of sending. The full event list and guarantees are in

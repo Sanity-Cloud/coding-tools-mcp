@@ -7,7 +7,9 @@ contents. The exact event list is documented in docs/telemetry.md.
 
 Controls, evaluated on every send decision:
 
-- ``CODING_TOOLS_MCP_TELEMETRY=off`` (or ``0``/``false``/``no``) disables sending.
+- Outbound PostHog telemetry is opt-in (default ``off``). Set
+  ``CODING_TOOLS_MCP_TELEMETRY=on`` (or ``1``/``true``/``yes``) to enable sending.
+- ``CODING_TOOLS_MCP_TELEMETRY=off`` (or ``0``/``false``/``no``) keeps sending disabled.
 - ``DO_NOT_TRACK=1`` disables sending.
 - ``CI`` set truthy disables sending so CI runs never pollute usage data.
 - ``CODING_TOOLS_MCP_TELEMETRY=debug`` prints events to stderr instead of sending.
@@ -52,13 +54,17 @@ QUEUE_LIMIT = 500
 SEND_TIMEOUT_SECONDS = 3.0
 
 _LABEL_LIMIT = 64
+_ON_VALUES = {"1", "on", "true", "yes", "enable", "enabled"}
 _OFF_VALUES = {"0", "off", "false", "no", "disable", "disabled"}
 _DURATION_BUCKETS = ((100, "dur_lt_100ms"), (1_000, "dur_lt_1s"), (10_000, "dur_lt_10s"))
 _DURATION_OVERFLOW = "dur_gte_10s"
 
 
 def telemetry_mode() -> str:
-    """Return ``"on"``, ``"off"``, or ``"debug"`` from the environment."""
+    """Return ``"on"``, ``"off"``, or ``"debug"`` from the environment.
+
+    Outbound PostHog telemetry is opt-in: unset/empty defaults to ``off``.
+    """
 
     raw = (os.environ.get(f"{ENV_PREFIX}_TELEMETRY") or "").strip().lower()
     if raw == "debug":
@@ -67,7 +73,9 @@ def telemetry_mode() -> str:
         return "off"
     if truthy_env(os.environ.get("DO_NOT_TRACK")) or truthy_env(os.environ.get("CI")):
         return "off"
-    return "on"
+    if raw in _ON_VALUES:
+        return "on"
+    return "off"
 
 
 def _label(value: Any) -> str | None:
@@ -99,19 +107,25 @@ def install_id() -> str:
     with _install_id_lock:
         if _install_id:
             return _install_id
-        path = Path.home() / ".coding-tools-mcp" / "id"
         try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            value = ""
+            path: Path | None = Path.home() / ".coding-tools-mcp" / "id"
+        except (OSError, RuntimeError):
+            path = None
+        value = ""
+        if path is not None:
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                value = ""
         if not _looks_like_install_id(value):
             value = uuid.uuid4().hex
-            try:
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                path.write_text(value + "\n", encoding="utf-8")
-                path.chmod(0o600)
-            except OSError:
-                pass
+            if path is not None:
+                try:
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    path.write_text(value + "\n", encoding="utf-8")
+                    path.chmod(0o600)
+                except OSError:
+                    pass
         _install_id = value
         return value
 

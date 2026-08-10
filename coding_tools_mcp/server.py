@@ -1558,7 +1558,10 @@ class Runtime:
             session.drain_readers()
         if getattr(self, "_owns_runtime_dir", True):
             shutil.rmtree(self.runtime_dir, ignore_errors=True)
-        self.telemetry.finish()
+        try:
+            self.telemetry.finish()
+        except Exception:
+            pass
 
     def _ensure_runtime_dirs(self) -> None:
         candidates = [self.runtime_dir]

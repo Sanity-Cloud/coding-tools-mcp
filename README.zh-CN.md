@@ -152,11 +152,12 @@ coding-tools-mcp-desktop
 
 ## 遥测
 
-服务器会发送匿名使用遥测（每工具的成功率/延迟计数与版本/平台维度——
-绝不包含路径、参数、命令或文件内容），用于确定修复优先级。设置
-`CODING_TOOLS_MCP_TELEMETRY=off` 或 `DO_NOT_TRACK=1` 可关闭；CI 环境自动
-关闭。`CODING_TOOLS_MCP_TELEMETRY=debug` 会把每个事件打印到 stderr 而不
-发送。完整事件清单与承诺见 [docs/telemetry.md](docs/telemetry.md)。
+出站 PostHog 遥测为 opt-in（默认关闭）。设置 `CODING_TOOLS_MCP_TELEMETRY=on`
+后，服务器才会发送匿名使用遥测（每工具的成功率/延迟计数与版本/平台维度——
+绝不包含路径、参数、命令或文件内容）。用 `CODING_TOOLS_MCP_TELEMETRY=off`
+或 `DO_NOT_TRACK=1` 可保持关闭；CI 环境自动关闭。
+`CODING_TOOLS_MCP_TELEMETRY=debug` 会把每个事件打印到 stderr 而不发送。
+完整事件清单与承诺见 [docs/telemetry.md](docs/telemetry.md)。
 
 ## 证据、Dogfood 与 SWE-bench
 
