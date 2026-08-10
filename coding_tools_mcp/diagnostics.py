@@ -140,6 +140,9 @@ def _sanitize_args(args: dict[str, Any]) -> dict[str, Any]:
 def classify_failure(tool_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     """Return a normalized failure classification for durable diagnostics."""
 
+    if payload.get("outcome_expected") is True:
+        return None
+
     raw_error = payload.get("error")
     error = raw_error if isinstance(raw_error, dict) else {}
     if payload.get("ok") is False:

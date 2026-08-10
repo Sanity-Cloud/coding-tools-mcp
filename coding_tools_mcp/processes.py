@@ -235,6 +235,9 @@ class ExecSession:
     terminating: bool = False
     pty_master_fd: int | None = None
     cleanup_paths: list[Path] = field(default_factory=list)
+    expected_exit_codes: frozenset[int] = field(default_factory=frozenset)
+    expected_timeout: bool = False
+    diagnostic_mode: str = "normal"
     _stdin_closed: bool = False
 
     @property

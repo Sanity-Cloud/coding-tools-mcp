@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `exec_command` now accepts `expected_exit_codes`, `expected_timeout`, and
+  `diagnostic_mode="probe"` so intentional failure probes retain their real
+  output/status without polluting the durable incident ledger.
+- `server_info` and `check_exec_environment` now report the private
+  `runtime_home` separately from the effective command `home`, plus explicit
+  `tty_supported` / `tty_backend` capability metadata.
+
+### Fixed
+
+- Windows command `HOME` now defaults to the authenticated `USERPROFILE`,
+  keeping POSIX-style Windows CLIs on the same profile as native applications.
+  `CODING_TOOLS_MCP_WINDOWS_HOME_MODE=isolated` preserves the prior private-HOME
+  behavior when explicitly required; runtime temp/cache storage remains private.
+- Direct `argv` process-start failures now return structured
+  `EXECUTABLE_NOT_FOUND`, `EXECUTABLE_ACCESS_DENIED`, or `EXEC_START_FAILED`
+  errors instead of leaking generic internal process-creation failures. The
+  missing-executable result explicitly distinguishes executables from PowerShell
+  cmdlets/functions.
+- `git_log(path=...)` now executes against the repository actually resolved from
+  that path. This fixes additional-root/worktree calls that were first validated
+  against the requested worktree and then incorrectly executed with `git -C`
+  against the primary workspace.
+
 ## 0.2.3 - 2026-08-10
 
 ### Added

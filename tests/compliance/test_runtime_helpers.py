@@ -588,7 +588,7 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(env.get("APPDATA"), host_env["APPDATA"])
             self.assertEqual(env.get("LOCALAPPDATA"), host_env["LOCALAPPDATA"])
             self.assertEqual(env.get("CUSTOM"), "ok")
-            self.assertEqual(env.get("HOME"), str(runtime.command_home_dir()))
+            self.assertEqual(env.get("HOME"), host_env["USERPROFILE"])
             self.assertEqual(env.get("TEMP"), str(runtime.command_tmp_dir()))
             self.assertEqual(env.get("TMP"), str(runtime.command_tmp_dir()))
             self.assertNotIn("INCLUDE", env)
@@ -600,7 +600,7 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertNotIn("UNRELATED", env)
             self.assertNotIn("VSCMD_SECRET", env)
             self.assertNotIn("OPENAI_API_KEY", env)
-            self.assertTrue(runtime.command_home_dir().is_dir())
+            self.assertTrue(runtime.runtime_home_dir().is_dir())
             self.assertTrue(runtime.command_tmp_dir().is_dir())
             self.assertTrue(runtime.cache_dir.is_dir())
             self.assertFalse((workspace / ".coding-tools").exists())
@@ -635,9 +635,25 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(env.get("HOMEDRIVE"), "C:")
             self.assertEqual(env.get("HOMEPATH"), r"\Users\Example")
             self.assertEqual(env.get("USERNAME"), "Example")
-            # CLI dotfiles still use CodingTools' private HOME; Windows-native
-            # applications use USERPROFILE/AppData from the real user session.
-            self.assertEqual(env.get("HOME"), str(runtime.command_home_dir()))
+            # POSIX-style Windows CLIs and native Windows applications now see
+            # the same authenticated user profile by default.
+            self.assertEqual(env.get("HOME"), r"C:\Users\Example")
+
+    def test_windows_command_home_can_be_explicitly_isolated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp))
+            host_env = {
+                "Path": r"C:\Windows\System32",
+                "USERPROFILE": r"C:\Users\Example",
+                server_module.WINDOWS_HOME_MODE_ENV: "isolated",
+            }
+            with (
+                patch.object(server_module.os, "name", "nt"),
+                patch.dict(server_module.os.environ, host_env, clear=True),
+            ):
+                env = runtime._command_env({})
+                self.assertEqual(server_module.windows_command_home_mode(), "isolated")
+            self.assertEqual(env.get("HOME"), str(runtime.runtime_home_dir()))
 
     def test_command_env_uses_external_home_tmp_and_cache_without_ecosystem_cache_vars(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1593,6 +1609,28 @@ Maven home: /usr/share/maven
 
             with self.assertRaises(ToolFailure):
                 runtime.set_default_cwd({"path": "../outside"})
+
+    def test_git_log_uses_requested_repository_root_across_workspace_roots(self) -> None:
+        preflight_error = git_fixture_preflight_error()
+        if preflight_error is not None:
+            self.skipTest(preflight_error)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = root / "primary"
+            secondary = root / "secondary"
+            primary.mkdir()
+            secondary.mkdir()
+            (primary / "primary.txt").write_text("primary\n", encoding="utf-8")
+            (secondary / "secondary.txt").write_text("secondary\n", encoding="utf-8")
+            init_git(primary)
+            init_git(secondary)
+
+            runtime = Runtime(primary, workspace_roots=[primary, secondary])
+            log = runtime.git_log({"path": str(secondary), "max_count": 1})
+            self.assertTrue(log.get("is_repo"), log)
+            self.assertEqual(Path(str(log.get("repository"))).resolve(), secondary.resolve())
+            self.assertEqual(log.get("path"), ".")
+            self.assertEqual(log.get("commits", [])[0].get("subject"), "baseline fixture")
 
     def test_boundary_regressions_for_aliases_and_command_scanning(self) -> None:
         with TemporaryDirectory() as tmp:
