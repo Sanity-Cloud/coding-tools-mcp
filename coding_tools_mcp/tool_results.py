@@ -235,7 +235,8 @@ def _render_git_status(payload: dict[str, Any]) -> str:
     if not payload.get("is_repo", True):
         return "Not a Git repository."
     branch = payload.get("branch") or "detached"
-    entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+    raw_entries = payload.get("entries")
+    entries: list[Any] = raw_entries if isinstance(raw_entries, list) else []
     lines = [f"## {branch}"]
     for entry in entries:
         if not isinstance(entry, dict):

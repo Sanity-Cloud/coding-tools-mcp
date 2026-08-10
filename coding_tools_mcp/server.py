@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -2259,7 +2259,7 @@ class Runtime:
         if truncated:
             warnings.append("content truncated")
 
-        result = {
+        result: dict[str, Any] = {
             "path": resolved.display,
             "file_path": str(resolved.path),
             "file_name": resolved.path.name,
@@ -4252,7 +4252,7 @@ def walk_files(root: Path) -> Iterator[Path]:
             yield current_path / name
 
 
-def path_batches(paths: Iterator[Path], size: int) -> Iterator[list[Path]]:
+def path_batches(paths: Iterable[Path], size: int) -> Iterator[list[Path]]:
     batch: list[Path] = []
     for path in paths:
         batch.append(path)
@@ -4956,7 +4956,7 @@ def open_landlock_ruleset(
 
 def add_landlock_path(ruleset_fd: int, path: Path, allowed_access: int, *, required: bool = True) -> None:
     try:
-        fd = os.open(path, getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC)
+        fd = os.open(path, getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
         if required:
             raise ToolFailure(
@@ -5207,7 +5207,7 @@ def resize_image_bytes(
     except Exception:
         return None
     try:
-        image = Image.open(BytesIO(data))
+        image: Any = Image.open(BytesIO(data))
         image.thumbnail((max_width, max_height))
         output = BytesIO()
         output_format = "JPEG" if mime_type == "image/jpeg" else "PNG" if mime_type == "image/png" else "WEBP"
@@ -5902,8 +5902,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         method = request.get("method")
         session_id = self.headers.get("Mcp-Session-Id")
-        params = request.get("params") if isinstance(request.get("params"), dict) else {}
-        client_info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
+        raw_params = request.get("params")
+        params: dict[str, Any] = cast(dict[str, Any], raw_params) if isinstance(raw_params, dict) else {}
+        raw_client_info = params.get("clientInfo")
+        client_info: dict[str, Any] = (
+            cast(dict[str, Any], raw_client_info) if isinstance(raw_client_info, dict) else {}
+        )
         user_agent = self.headers.get("User-Agent", "")
         stateless_client = is_stateless_http_client(client_info, user_agent)
         created_session = False

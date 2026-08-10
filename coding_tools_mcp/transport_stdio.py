@@ -40,6 +40,7 @@ def serve_stdio(
         for line in source:
             if not line.strip():
                 continue
+            response: dict[str, Any] | None
             try:
                 request = json.loads(line)
             except json.JSONDecodeError:

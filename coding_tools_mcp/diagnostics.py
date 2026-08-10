@@ -101,19 +101,19 @@ def _sanitize(value: Any, *, key: str = "", depth: int = 0) -> Any:
     if isinstance(value, str):
         return _redact_string(value)
     if isinstance(value, dict):
-        result: dict[str, Any] = {}
+        dict_result: dict[str, Any] = {}
         for raw_key, raw_value in list(value.items())[:_MAX_LIST]:
             child_key = str(raw_key)
-            result[child_key] = _sanitize(raw_value, key=child_key, depth=depth + 1)
+            dict_result[child_key] = _sanitize(raw_value, key=child_key, depth=depth + 1)
         if len(value) > _MAX_LIST:
-            result["_truncated_items"] = len(value) - _MAX_LIST
-        return result
+            dict_result["_truncated_items"] = len(value) - _MAX_LIST
+        return dict_result
     if isinstance(value, (list, tuple)):
         values = list(value)
-        result = [_sanitize(item, depth=depth + 1) for item in values[:_MAX_LIST]]
+        list_result = [_sanitize(item, depth=depth + 1) for item in values[:_MAX_LIST]]
         if len(values) > _MAX_LIST:
-            result.append(f"<truncated {len(values) - _MAX_LIST} items>")
-        return result
+            list_result.append(f"<truncated {len(values) - _MAX_LIST} items>")
+        return list_result
     return _redact_string(repr(value))
 
 
