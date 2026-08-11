@@ -577,29 +577,31 @@ class RuntimeHelperTests(unittest.TestCase):
             ):
                 env = runtime._command_env({"CUSTOM": "ok", "OPENAI_API_KEY": "sk-test-secret-value"})
 
-            self.assertEqual(env.get("Path"), host_env["Path"])
-            self.assertEqual(env.get("PATHEXT"), host_env["PATHEXT"])
-            self.assertEqual(env.get("SystemRoot"), host_env["SystemRoot"])
-            self.assertEqual(env.get("ComSpec"), host_env["ComSpec"])
-            self.assertEqual(env.get("USERPROFILE"), host_env["USERPROFILE"])
-            self.assertEqual(env.get("HOMEDRIVE"), host_env["HOMEDRIVE"])
-            self.assertEqual(env.get("HOMEPATH"), host_env["HOMEPATH"])
-            self.assertEqual(env.get("USERNAME"), host_env["USERNAME"])
-            self.assertEqual(env.get("APPDATA"), host_env["APPDATA"])
-            self.assertEqual(env.get("LOCALAPPDATA"), host_env["LOCALAPPDATA"])
-            self.assertEqual(env.get("CUSTOM"), "ok")
-            self.assertEqual(env.get("HOME"), host_env["USERPROFILE"])
-            self.assertEqual(env.get("TEMP"), str(runtime.command_tmp_dir()))
-            self.assertEqual(env.get("TMP"), str(runtime.command_tmp_dir()))
-            self.assertNotIn("INCLUDE", env)
-            self.assertNotIn("LIB", env)
-            self.assertNotIn("LIBPATH", env)
-            self.assertNotIn("WindowsSdkDir", env)
-            self.assertNotIn("VCToolsInstallDir", env)
-            self.assertNotIn("VSCMD_ARG_TGT_ARCH", env)
-            self.assertNotIn("UNRELATED", env)
-            self.assertNotIn("VSCMD_SECRET", env)
-            self.assertNotIn("OPENAI_API_KEY", env)
+            env_ci = {key.upper(): value for key, value in env.items()}
+            host_ci = {key.upper(): value for key, value in host_env.items()}
+            self.assertEqual(env_ci.get("PATH"), host_ci["PATH"])
+            self.assertEqual(env_ci.get("PATHEXT"), host_ci["PATHEXT"])
+            self.assertEqual(env_ci.get("SYSTEMROOT"), host_ci["SYSTEMROOT"])
+            self.assertEqual(env_ci.get("COMSPEC"), host_ci["COMSPEC"])
+            self.assertEqual(env_ci.get("USERPROFILE"), host_ci["USERPROFILE"])
+            self.assertEqual(env_ci.get("HOMEDRIVE"), host_ci["HOMEDRIVE"])
+            self.assertEqual(env_ci.get("HOMEPATH"), host_ci["HOMEPATH"])
+            self.assertEqual(env_ci.get("USERNAME"), host_ci["USERNAME"])
+            self.assertEqual(env_ci.get("APPDATA"), host_ci["APPDATA"])
+            self.assertEqual(env_ci.get("LOCALAPPDATA"), host_ci["LOCALAPPDATA"])
+            self.assertEqual(env_ci.get("CUSTOM"), "ok")
+            self.assertEqual(env_ci.get("HOME"), host_ci["USERPROFILE"])
+            self.assertEqual(env_ci.get("TEMP"), str(runtime.command_tmp_dir()))
+            self.assertEqual(env_ci.get("TMP"), str(runtime.command_tmp_dir()))
+            self.assertNotIn("INCLUDE", env_ci)
+            self.assertNotIn("LIB", env_ci)
+            self.assertNotIn("LIBPATH", env_ci)
+            self.assertNotIn("WINDOWSSDKDIR", env_ci)
+            self.assertNotIn("VCTOOLSINSTALLDIR", env_ci)
+            self.assertNotIn("VSCMD_ARG_TGT_ARCH", env_ci)
+            self.assertNotIn("UNRELATED", env_ci)
+            self.assertNotIn("VSCMD_SECRET", env_ci)
+            self.assertNotIn("OPENAI_API_KEY", env_ci)
             self.assertTrue(runtime.runtime_home_dir().is_dir())
             self.assertTrue(runtime.command_tmp_dir().is_dir())
             self.assertTrue(runtime.cache_dir.is_dir())
@@ -878,7 +880,7 @@ class RuntimeHelperTests(unittest.TestCase):
 
     def test_exec_command_warns_and_runs_when_landlock_is_unavailable(self) -> None:
         with TemporaryDirectory() as tmp:
-            runtime = Runtime(Path(tmp))
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
             original = server_module.open_landlock_ruleset
 
             def unavailable(_workspace: Path, _read_roots: list[str], **_kwargs: object) -> int:
@@ -886,7 +888,13 @@ class RuntimeHelperTests(unittest.TestCase):
 
             server_module.open_landlock_ruleset = unavailable
             try:
-                result = runtime.exec_command({"cmd": "printf ok", "timeout_ms": 5000, "yield_time_ms": 1000})
+                result = runtime.exec_command(
+                    {
+                        "argv": [sys.executable, "-c", "print('ok', end='')"],
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 1000,
+                    }
+                )
             finally:
                 server_module.open_landlock_ruleset = original
 
@@ -976,12 +984,16 @@ class RuntimeHelperTests(unittest.TestCase):
                 clear=True,
             ):
                 roots = set(guard_allow_roots())
-        self.assertIn("/etc/resolv.conf", roots)
-        self.assertIn("/etc/hosts", roots)
-        self.assertIn("/usr", roots)
-        self.assertIn("/usr/local/sdkman/candidates", roots)
-        self.assertIn("/etc/gitconfig", roots)
-        self.assertIn("/etc/gitconfig.d", roots)
+        if os.name == "nt":
+            self.assertNotIn("/etc/resolv.conf", roots)
+            self.assertNotIn("/usr", roots)
+        else:
+            self.assertIn("/etc/resolv.conf", roots)
+            self.assertIn("/etc/hosts", roots)
+            self.assertIn("/usr", roots)
+            self.assertIn("/usr/local/sdkman/candidates", roots)
+            self.assertIn("/etc/gitconfig", roots)
+            self.assertIn("/etc/gitconfig.d", roots)
         self.assertIn(str(java_home.resolve()), roots)
         self.assertIn(str(explicit_root.resolve()), roots)
         self.assertNotIn(str(private_path_dir.resolve()), roots)
@@ -994,21 +1006,26 @@ class RuntimeHelperTests(unittest.TestCase):
             runtime = Runtime(workspace)
             with patch.dict(server_module.os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True):
                 self.assertNotIn("GIT_CONFIG_NOSYSTEM", runtime._command_env({}))
-                result = runtime.exec_command(
-                    {
-                        "cmd": (
-                            "git init -q tmp-git-repo && "
-                            "git -C tmp-git-repo config user.email test@example.invalid && "
-                            "git -C tmp-git-repo config user.name Test"
-                        ),
-                        "timeout_ms": 10000,
-                        "yield_time_ms": 30000,
-                        "max_output_bytes": 20000,
-                    }
-                )
-        self.assertEqual(result.get("status"), "exited", result)
-        self.assertEqual(result.get("exit_code"), 0, result)
-        self.assertNotIn("unable to access '/etc/gitconfig'", str(result.get("stderr", "")))
+                results = []
+                for argv in (
+                    ["git", "init", "-q", "tmp-git-repo"],
+                    ["git", "-C", "tmp-git-repo", "config", "user.email", "test@example.invalid"],
+                    ["git", "-C", "tmp-git-repo", "config", "user.name", "Test"],
+                ):
+                    results.append(
+                        runtime.exec_command(
+                            {
+                                "argv": argv,
+                                "timeout_ms": 10000,
+                                "yield_time_ms": 30000,
+                                "max_output_bytes": 20000,
+                            }
+                        )
+                    )
+        for result in results:
+            self.assertEqual(result.get("status"), "exited", result)
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertNotIn("unable to access '/etc/gitconfig'", str(result.get("stderr", "")))
 
     def test_exec_diagnostics_classify_common_failures(self) -> None:
         self.assertEqual(
@@ -1211,13 +1228,28 @@ Maven home: /usr/share/maven
 
     def test_exec_running_model_text_names_the_poll_call(self) -> None:
         with TemporaryDirectory() as tmp:
-            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            result = runtime.call_tool(
                 "exec_command",
-                {"cmd": "sleep 1", "timeout_ms": 10000, "yield_time_ms": 0},
+                {
+                    "argv": [sys.executable, "-c", "import time; time.sleep(1)"],
+                    "timeout_ms": 10000,
+                    "yield_time_ms": 0,
+                },
             )
-            model_text = self.agent_text(result)
-            self.assertIn("Status: running", model_text)
-            self.assertIn('write_stdin(session_id="', model_text)
+            try:
+                model_text = self.agent_text(result)
+                self.assertIn("Status: running", model_text)
+                self.assertIn('write_stdin(session_id="', model_text)
+            finally:
+                runtime.kill_session(
+                    {
+                        "session_id": result["structuredContent"]["session_id"],
+                        "signal": "KILL",
+                        "wait_ms": 1000,
+                    }
+                )
+                runtime.close()
 
     def test_read_file_truncation_is_visible_with_continuation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1405,7 +1437,7 @@ Maven home: /usr/share/maven
             runtime = Runtime(Path(tmp), permission_mode="trusted")
             result = runtime.exec_command(
                 {
-                    "cmd": "printf 'alpha\nbeta\n'",
+                    "argv": [sys.executable, "-c", "print('alpha'); print('beta')"],
                     "timeout_ms": 5000,
                     "yield_time_ms": 30000,
                     "verbosity": "preview",
@@ -1513,40 +1545,45 @@ Maven home: /usr/share/maven
             runtime = Runtime(Path(tmp), permission_mode="trusted")
             script = (
                 "import sys,time;"
-                "sys.stderr.write('err1\\nerr2\\n'); sys.stderr.flush();"
-                "sys.stdout.write('out1\\n'); sys.stdout.flush();"
+                "sys.stderr.buffer.write(b'err1\\nerr2\\n'); sys.stderr.buffer.flush();"
+                "sys.stdout.buffer.write(b'out1\\n'); sys.stdout.buffer.flush();"
                 "time.sleep(0.4);"
-                "sys.stdout.write('out2\\n'); sys.stdout.flush();"
+                "sys.stdout.buffer.write(b'out2\\n'); sys.stdout.buffer.flush();"
                 "time.sleep(1)"
             )
             result = runtime.exec_command(
                 {
-                    "cmd": f"{sys.executable} -c {script!r}",
+                    "argv": [sys.executable, "-c", script],
                     "timeout_ms": 5000,
                     "yield_time_ms": 100,
                     "verbosity": "preview",
                     "preview_bytes": 64,
                 }
             )
-            self.assertEqual(result.get("status"), "running", result)
-            output_refs = result.get("output_refs")
-            self.assertIsInstance(output_refs, dict)
-            stderr_ref = output_refs["stderr"]
+            try:
+                self.assertEqual(result.get("status"), "running", result)
+                output_refs = result.get("output_refs")
+                self.assertIsInstance(output_refs, dict)
+                stderr_ref = output_refs["stderr"]
 
-            first: dict[str, object] = {}
-            for _ in range(10):
-                first = runtime.read_output({"output_ref": stderr_ref, "offset": 0, "limit": 5})
-                if first.get("content"):
-                    break
-                time.sleep(0.05)
-            self.assertEqual(first.get("content"), "err1\n")
-            self.assertEqual(first.get("next_offset"), 5)
-            time.sleep(0.6)
-            second = runtime.read_output({"output_ref": stderr_ref, "offset": first["next_offset"], "limit": 64})
-            self.assertEqual(second.get("offset"), first.get("next_offset"))
-            self.assertEqual(second.get("content"), "err2\n")
-            self.assertNotIn("out2", second.get("content", ""))
-            runtime.kill_session({"session_id": result["session_id"], "wait_ms": 1000})
+                first: dict[str, object] = {}
+                for _ in range(10):
+                    first = runtime.read_output({"output_ref": stderr_ref, "offset": 0, "limit": 5})
+                    if first.get("content"):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(first.get("content"), "err1\n")
+                self.assertEqual(first.get("next_offset"), 5)
+                time.sleep(0.6)
+                second = runtime.read_output(
+                    {"output_ref": stderr_ref, "offset": first["next_offset"], "limit": 64}
+                )
+                self.assertEqual(second.get("offset"), first.get("next_offset"))
+                self.assertEqual(second.get("content"), "err2\n")
+                self.assertNotIn("out2", second.get("content", ""))
+            finally:
+                runtime.kill_session({"session_id": result["session_id"], "wait_ms": 1000})
+                runtime.close()
 
     def test_read_output_uses_absolute_stream_offsets_after_buffer_drop(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1577,7 +1614,7 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "src").mkdir()
-            (workspace / "src" / "hello.txt").write_text("hello\n", encoding="utf-8")
+            (workspace / "src" / "hello.txt").write_bytes(b"hello\n")
             for cmd in (
                 ["git", "init", "-q"],
                 ["git", "config", "user.email", "test@example.invalid"],
@@ -1636,32 +1673,44 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "nested").mkdir()
-            (workspace / "sample.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            (workspace / "sample.txt").write_bytes(b"one\ntwo\nthree\n")
             runtime = Runtime(workspace, permission_mode="trusted")
 
             cwd_result = runtime.exec_command(
-                {"cmd": "pwd", "cwd": "nested", "timeout_ms": 5000, "max_output_bytes": 4096}
+                {
+                    "argv": [sys.executable, "-c", "import os; print(os.getcwd())"],
+                    "cwd": "nested",
+                    "timeout_ms": 5000,
+                    "max_output_bytes": 4096,
+                }
             )
             self.assertEqual(cwd_result.get("exit_code"), 0)
             self.assertEqual(Path(str(cwd_result.get("stdout", "")).strip()).name, "nested")
 
             with self.assertRaises(ToolFailure):
-                runtime.exec_command({"cmd": "pwd", "workdir": ".", "cwd": "nested"})
+                runtime.exec_command(
+                    {
+                        "argv": [sys.executable, "-c", "import os; print(os.getcwd())"],
+                        "workdir": ".",
+                        "cwd": "nested",
+                    }
+                )
 
             read = runtime.read_file({"path": "sample.txt", "start_line": 2, "max_lines": 1})
             self.assertEqual(read.get("content"), "two\n")
             self.assertEqual(read.get("end_line"), 2)
 
-            tag = "model" + "Version"
-            xml_heredoc = (
-                "cat > pom.xml <<'EOF'\n"
-                "<project>\n"
-                f"  <{tag}>4.0.0</{tag}>\n"
-                "</project>\n"
-                "EOF"
-            )
-            runtime.exec_command({"cmd": xml_heredoc, "timeout_ms": 5000, "max_output_bytes": 4096})
-            self.assertIn(tag, (workspace / "pom.xml").read_text(encoding="utf-8"))
+            if os.name != "nt":
+                tag = "model" + "Version"
+                xml_heredoc = (
+                    "cat > pom.xml <<'EOF'\n"
+                    "<project>\n"
+                    f"  <{tag}>4.0.0</{tag}>\n"
+                    "</project>\n"
+                    "EOF"
+                )
+                runtime.exec_command({"cmd": xml_heredoc, "timeout_ms": 5000, "max_output_bytes": 4096})
+                self.assertIn(tag, (workspace / "pom.xml").read_text(encoding="utf-8"))
 
     def test_heredoc_payload_stripping_keeps_live_shell_code_scanned(self) -> None:
         with TemporaryDirectory() as tmp:
