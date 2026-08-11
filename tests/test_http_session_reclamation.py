@@ -100,6 +100,55 @@ def test_prune_skips_in_flight_and_reclaims_after_release() -> None:
     assert manager.snapshot()["pruned_total"] == 1
 
 
+def test_snapshot_prunes_expired_idle_sessions_before_reporting_counts() -> None:
+    now = [100.0]
+    runtime = FakeRuntime("s1")
+    manager = HTTPSessionManager(
+        lambda: runtime,
+        max_sessions=2,
+        ttl_seconds=10,
+        eviction_grace_seconds=0,
+        clock=lambda: now[0],
+    )
+    created = manager.create()
+    manager.release(created.http_session_id)
+    now[0] += 20
+
+    snapshot = manager.snapshot()
+
+    assert snapshot["active_sessions"] == 0
+    assert snapshot["in_flight"] == 0
+    assert snapshot["pruned_total"] == 1
+    assert snapshot["oldest_idle_age_seconds"] == 0.0
+    assert runtime.closed == 1
+
+
+def test_snapshot_preserves_expired_in_flight_sessions() -> None:
+    now = [100.0]
+    runtime = FakeRuntime("s1")
+    manager = HTTPSessionManager(
+        lambda: runtime,
+        max_sessions=2,
+        ttl_seconds=10,
+        eviction_grace_seconds=0,
+        clock=lambda: now[0],
+    )
+    created = manager.create()
+    now[0] += 20
+
+    snapshot = manager.snapshot()
+
+    assert snapshot["active_sessions"] == 1
+    assert snapshot["in_flight"] == 1
+    assert snapshot["pruned_total"] == 0
+    assert runtime.closed == 0
+
+    manager.release(created.http_session_id)
+    now[0] += 20
+    assert manager.snapshot()["active_sessions"] == 0
+    assert runtime.closed == 1
+
+
 def test_http_runtime_close_does_not_kill_workspace_shared_command_state() -> None:
     with TemporaryDirectory() as tmp:
         workspace = Path(tmp)

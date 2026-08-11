@@ -140,6 +140,7 @@ class HTTPSessionManager:
             _close_runtime(record.runtime)
 
     def snapshot(self) -> dict[str, Any]:
+        self.prune()
         now = self._clock()
         with self._lock:
             records = list(self._sessions.values())
